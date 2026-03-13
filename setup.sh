@@ -32,7 +32,9 @@ setup_hf() {
         echo "HF_TOKEN=$token" >> .env
         
         echo "Installing Hugging Face CLI..."
-        yes | pip install --upgrade huggingface_hub
+        yes | poetry add huggingface_hub
+        poetry lock
+        poetry install
         echo "Logging in to Hugging Face CLI..."
         huggingface-cli login --token $token
     else
@@ -63,7 +65,7 @@ setup_venv() {
 install_requirements() {
     echo "Installing requirements..."
 
-    yes | pip install -r requirements.txt --upgrade
+    yes | poetry install
 
     echo "Done installing requirements!"
 }
@@ -79,7 +81,7 @@ fi
 
 setup_hf
 setup_together
-setup_venv
+
 install_requirements
 
 echo "All set up!"
