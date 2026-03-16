@@ -7,8 +7,9 @@ from jaxtyping import Int, Float
 from pipeline.utils.hook_utils import add_hooks
 
 class ModelBase(ABC):
-    def __init__(self, model_name_or_path: str):
+    def __init__(self, model_name_or_path: str, device: str = 'auto'):
         self.model_name_or_path = model_name_or_path
+        self.device = device
         self.model: AutoModelForCausalLM = self._load_model(model_name_or_path)
         self.tokenizer: AutoTokenizer = self._load_tokenizer(model_name_or_path)
         

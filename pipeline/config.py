@@ -8,6 +8,8 @@ from typing import Tuple
 class Config:
     model_alias: str
     model_path: str
+    device: str = 'auto'
+    vllm_gpu_memory_utilization: float = 0.9
     n_train: int = 128
     n_test: int = 100
     n_val: int = 32

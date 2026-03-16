@@ -88,7 +88,7 @@ class GemmaModel(ModelBase):
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            device_map="cuda",
+            device_map=self.device,
         ).eval()
 
         model.requires_grad_(False) 

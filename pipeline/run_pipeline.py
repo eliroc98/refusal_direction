@@ -19,6 +19,12 @@ def parse_arguments():
     """Parse model path argument from command line."""
     parser = argparse.ArgumentParser(description="Parse model path argument.")
     parser.add_argument('--model_path', type=str, required=True, help='Path to the model')
+    parser.add_argument('--device', type=str, default='auto',
+                        help='Device for model loading. Use "auto" to spread across all available GPUs, '
+                             'or specify a single device such as "cuda:0" or "cpu". (default: auto)')
+    parser.add_argument('--vllm_gpu_memory_utilization', type=float, default=0.9,
+                        help='Fraction of GPU memory vLLM classifiers (LlamaGuard2, HarmBench) may use. '
+                             'Lower this if the main model and classifiers compete for memory. (default: 0.9)')
     return parser.parse_args()
 
 def load_and_sample_datasets(cfg):
@@ -116,6 +122,7 @@ def evaluate_completions_and_save_results_for_dataset(cfg, intervention_label, d
         completions=completions,
         methodologies=eval_methodologies,
         evaluation_path=os.path.join(cfg.artifact_path(), "completions", f"{dataset_name}_{intervention_label}_evaluations.json"),
+        vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
     )
 
     with open(f'{cfg.artifact_path()}/completions/{dataset_name}_{intervention_label}_evaluations.json', "w") as f:
@@ -133,12 +140,13 @@ def evaluate_loss_for_datasets(cfg, model_base, fwd_pre_hooks, fwd_hooks, interv
     with open(f'{cfg.artifact_path()}/loss_evals/{intervention_label}_loss_eval.json', "w") as f:
         json.dump(loss_evals, f, indent=4)
 
-def run_pipeline(model_path):
+def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9):
     """Run the full pipeline."""
     model_alias = os.path.basename(model_path)
-    cfg = Config(model_alias=model_alias, model_path=model_path)
+    cfg = Config(model_alias=model_alias, model_path=model_path, device=device,
+                 vllm_gpu_memory_utilization=vllm_gpu_memory_utilization)
 
-    model_base = construct_model_base(cfg.model_path)
+    model_base = construct_model_base(cfg.model_path, device=cfg.device)
 
     # Load and sample datasets
     harmful_train, harmless_train, harmful_val, harmless_val = load_and_sample_datasets(cfg)
@@ -147,9 +155,11 @@ def run_pipeline(model_path):
     harmful_train, harmless_train, harmful_val, harmless_val = filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val)
 
     # 1. Generate candidate refusal directions
+    # TODO: generate candidate nullspace projections
     candidate_directions = generate_and_save_candidate_directions(cfg, model_base, harmful_train, harmless_train)
     
     # 2. Select the most effective refusal direction
+    # TODO: select the most effective nullspace projection
     pos, layer, direction = select_and_save_direction(cfg, model_base, harmful_val, harmless_val, candidate_directions)
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
@@ -173,7 +183,7 @@ def run_pipeline(model_path):
 
     generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
     
-    actadd_refusal_pre_hooks, actadd_refusal_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=+1.0))], []
+    actadd_refusal_pre_hooks, actadd_refusal_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=+1.0))], [] #why is the coeff here +1.0? because we want to add the refusal direction to the activations to see if it induces refusals on the harmless dataset, which would indicate that the direction is not perfectly specific to harmful instructions
     generate_and_save_completions_for_dataset(cfg, model_base, actadd_refusal_pre_hooks, actadd_refusal_hooks, 'actadd', 'harmless', dataset=harmless_test)
 
     # 4b. Evaluate completions and save results on harmless evaluation dataset
@@ -187,4 +197,5 @@ def run_pipeline(model_path):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run_pipeline(model_path=args.model_path)
+    run_pipeline(model_path=args.model_path, device=args.device,
+                 vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization)
