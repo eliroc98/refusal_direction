@@ -32,9 +32,7 @@ setup_hf() {
         echo "HF_TOKEN=$token" >> .env
         
         echo "Installing Hugging Face CLI..."
-        yes | poetry add huggingface_hub
-        poetry lock
-        poetry install
+        yes | pip install --upgrade huggingface_hub
         echo "Logging in to Hugging Face CLI..."
         huggingface-cli login --token $token
     else
@@ -64,8 +62,11 @@ setup_venv() {
 
 install_requirements() {
     echo "Installing requirements..."
-
-    yes | poetry install
+    export TMPDIR=../tmp
+    mkdir -p $TMPDIR
+    grep -oP '"[^"]+==[^"]+"' pyproject.toml | tr -d '"' > requirements.txt
+    yes | pip install -r requirements.txt --no-cache-dir
+    rm requirements.txt
 
     echo "Done installing requirements!"
 }
@@ -81,7 +82,7 @@ fi
 
 setup_hf
 setup_together
-
+setup_venv
 install_requirements
 
 echo "All set up!"

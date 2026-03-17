@@ -1,3 +1,4 @@
+import gc
 import torch
 import random
 import json
@@ -165,6 +166,7 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9):
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
     actadd_fwd_pre_hooks, actadd_fwd_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=-1.0))], []
+    # TODO: add hooks for nullspace projection intervention
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
@@ -172,28 +174,34 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9):
         generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
         generate_and_save_completions_for_dataset(cfg, model_base, actadd_fwd_pre_hooks, actadd_fwd_hooks, 'actadd', dataset_name)
 
-    # 3b. Evaluate completions and save results on harmful evaluation datasets
-    for dataset_name in cfg.evaluation_datasets:
-        evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
-        evaluate_completions_and_save_results_for_dataset(cfg, 'ablation', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
-        evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
-    
     # 4a. Generate and save completions on harmless evaluation dataset
     harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
 
     generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
-    
+
     actadd_refusal_pre_hooks, actadd_refusal_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=+1.0))], [] #why is the coeff here +1.0? because we want to add the refusal direction to the activations to see if it induces refusals on the harmless dataset, which would indicate that the direction is not perfectly specific to harmful instructions
     generate_and_save_completions_for_dataset(cfg, model_base, actadd_refusal_pre_hooks, actadd_refusal_hooks, 'actadd', 'harmless', dataset=harmless_test)
-
-    # 4b. Evaluate completions and save results on harmless evaluation dataset
-    evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
-    evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
 
     # 5. Evaluate loss on harmless datasets
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
     evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
     evaluate_loss_for_datasets(cfg, model_base, actadd_fwd_pre_hooks, actadd_fwd_hooks, 'actadd')
+
+    # Free model_base from GPU before loading LlamaGuard2 for evaluation
+    model_base.del_model()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 3b. Evaluate completions and save results on harmful evaluation datasets
+    for dataset_name in cfg.evaluation_datasets:
+        evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
+        evaluate_completions_and_save_results_for_dataset(cfg, 'ablation', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
+        evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
+
+    # 4b. Evaluate completions and save results on harmless evaluation dataset
+    evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
+    evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
 
 if __name__ == "__main__":
     args = parse_arguments()
