@@ -214,6 +214,9 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9):
     evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
     # TODO: add evaluation for INLP direction intervention
 
+
+# TODO: make another version of the pipeline where the interventions are not done using a single projection or direction, but rather the specific direction extracted for each component in the model. At the moment, the same direction is applied to all components in the model, but it could be the case that different components require different directions for the intervention to be most effective. This would also be more in line with how the INLP classifier extracts directions, which are specific to each component in the model.
+
 if __name__ == "__main__":
     args = parse_arguments()
     run_pipeline(model_path=args.model_path, device=args.device,
