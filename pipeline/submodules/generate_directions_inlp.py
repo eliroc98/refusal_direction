@@ -11,14 +11,14 @@ Two outputs are produced:
                      (pos, layer) that projects activations into the subspace
                      orthogonal to ALL iteratively found refusal directions.
 
-Dependencies: scikit-learn (LogisticRegression), scipy.linalg.orth.
-No dependency on the number-words-constraint package.
+Linear classifiers are trained with PyTorch LBFGS on GPU (falls back to CPU).
+No sklearn or scipy dependency.
 """
 
 import os
 import numpy as np
-import scipy.linalg
 import torch
+import torch.nn.functional as F
 from typing import List, Optional, Tuple
 
 from jaxtyping import Float
@@ -31,33 +31,24 @@ from pipeline.model_utils.model_base import ModelBase
 
 # ─── INLP core ────────────────────────────────────────────────────────────────
 
-def _get_rowspace_projection(W: np.ndarray) -> np.ndarray:
-    """Orthogonal projection matrix onto the row space of W."""
-    if np.allclose(W, 0):
-        return np.zeros((W.shape[-1], W.shape[-1]))
-    basis = scipy.linalg.orth(W.T)
-    basis *= np.sign(basis[0, 0])   # resolve sign ambiguity
-    return basis @ basis.T
+def _get_rowspace_projection(W: torch.Tensor) -> torch.Tensor:
+    """W: (1, d) → (d, d) rowspace projection matrix, on same device as W."""
+    if W.norm() < 1e-9:
+        return torch.zeros(W.shape[-1], W.shape[-1], device=W.device, dtype=W.dtype)
+    _, _, Vh = torch.linalg.svd(W, full_matrices=False)  # Vh: (1, d)
+    return Vh.T @ Vh  # (d, d)
 
 
-def _get_nullspace_projection(rowspace_projections: List[np.ndarray], d: int) -> np.ndarray:
-    """Nullspace projection onto the intersection of all classifier nullspaces.
-
-    Uses Ben-Israel (2013):  N(w1) ∩ … ∩ N(wn) = N(P_R(w1) + … + P_R(wn))
-    """
-    Q = np.sum(rowspace_projections, axis=0)
-    return np.eye(d) - _get_rowspace_projection(Q)
-
-
-def _run_inlp_sklearn(
+def _run_inlp(
     X_train: np.ndarray,
     Y_train: np.ndarray,
     X_dev: np.ndarray,
     Y_dev: np.ndarray,
+    device: torch.device,
     n_classifiers: int = 20,
     min_accuracy: float = 0.55,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], List[float]]:
-    """Run INLP using logistic regression classifiers.
+    """Run INLP using PyTorch logistic regression on GPU.
 
     Returns
     -------
@@ -69,47 +60,66 @@ def _run_inlp_sklearn(
     accuracies : list[float]
         Dev-set accuracy at each INLP iteration.
     """
-    from sklearn.linear_model import LogisticRegression
-
     d = X_train.shape[-1]
-    rowspace_projections: List[np.ndarray] = []
+    dtype = torch.float32
+
+    Xtr = torch.from_numpy(X_train).to(device=device, dtype=dtype)
+    Ytr = torch.from_numpy(Y_train).to(device=device, dtype=dtype)
+    Xdv = torch.from_numpy(X_dev).to(device=device, dtype=dtype)
+    Ydv = torch.from_numpy(Y_dev)  # CPU for accuracy check
+
+    rowspace_projs: List[torch.Tensor] = []
     first_dir: Optional[np.ndarray] = None
     accuracies: List[float] = []
 
-    X_tr = X_train.copy()
-    X_dv = X_dev.copy()
+    Xtr_proj = Xtr.clone()
+    Xdv_proj = Xdv.clone()
+    P_current = torch.eye(d, device=device, dtype=dtype)
+    lam = 1.0 / (2 * 0.1 * len(Ytr))  # L2 reg equivalent to sklearn C=0.1
 
     for _ in range(n_classifiers):
-        clf = LogisticRegression(C=0.1, max_iter=1000, random_state=42,
-                                 solver='saga', n_jobs=1)
-        clf.fit(X_tr, Y_train)
-        acc = clf.score(X_dv, Y_dev)
+        W = torch.zeros(d, device=device, dtype=dtype, requires_grad=True)
+        b = torch.zeros(1, device=device, dtype=dtype, requires_grad=True)
+        opt = torch.optim.LBFGS([W, b], lr=1.0, max_iter=200, tolerance_grad=1e-5)
+
+        def closure():
+            opt.zero_grad()
+            loss = F.binary_cross_entropy_with_logits(Xtr_proj @ W + b, Ytr)
+            loss = loss + lam * W.pow(2).sum()
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+
+        with torch.no_grad():
+            preds = (Xdv_proj @ W + b > 0).cpu()
+            acc = (preds == Ydv.bool()).float().mean().item()
 
         if acc < min_accuracy:
             break
 
-        W = clf.coef_  # (1, d)
+        Wmat = W.detach().unsqueeze(0)  # (1, d)
 
         if first_dir is None:
-            # Orient so that harmful samples (label 1) score positively
-            scores = X_train @ W.T
-            if np.mean(scores[Y_train == 1]) < np.mean(scores[Y_train == 0]):
-                W = -W
-            norm = np.linalg.norm(W)
-            first_dir = W / norm if norm > 1e-9 else W.copy()
+            scores = Xtr @ Wmat.T
+            if scores[Ytr == 1].mean() < scores[Ytr == 0].mean():
+                Wmat = -Wmat
+            norm = Wmat.norm()
+            first_dir = (Wmat / norm if norm > 1e-9 else Wmat.clone()).cpu().numpy()
 
         accuracies.append(acc)
-        P_rowspace = _get_rowspace_projection(W)
-        rowspace_projections.append(P_rowspace)
+        rowspace_projs.append(_get_rowspace_projection(Wmat))
 
-        # Project onto intersection of current nullspaces (Ben-Israel stability)
-        P_current = _get_nullspace_projection(rowspace_projections, d)
-        X_tr = P_current.dot(X_train.T).T
-        X_dv = P_current.dot(X_dev.T).T
+        Q = torch.stack(rowspace_projs).sum(dim=0)
+        svdvals = torch.linalg.svdvals(Q)
+        _, _, Vh = torch.linalg.svd(Q, full_matrices=False)
+        rank = int((svdvals > 1e-7).sum())
+        P_current = torch.eye(d, device=device, dtype=dtype) - Vh[:rank].T @ Vh[:rank]
 
-    P = (_get_nullspace_projection(rowspace_projections, d)
-         if rowspace_projections else np.eye(d))
-    return P, first_dir, accuracies
+        Xtr_proj = (P_current @ Xtr.T).T
+        Xdv_proj = (P_current @ Xdv.T).T
+
+    return P_current.cpu().numpy(), first_dir, accuracies
 
 
 # ─── Activation extraction ────────────────────────────────────────────────────
@@ -241,11 +251,12 @@ def generate_directions_inlp(
             X = torch.cat([
                 harmful_acts[:,  pos_idx, layer_idx, :],
                 harmless_acts[:, pos_idx, layer_idx, :],
-            ], dim=0).numpy().astype(np.float64)   # (2*n_min, d_model)
+            ], dim=0).numpy()  # (2*n_min, d_model), float32
 
-            _, first_dir, _ = _run_inlp_sklearn(
+            _, first_dir, _ = _run_inlp(
                 X[train_idx], Y[train_idx],
                 X[val_idx],   Y[val_idx],
+                device=model_base.model.device,
                 n_classifiers=n_classifiers,
                 min_accuracy=min_accuracy,
             )
@@ -289,7 +300,7 @@ def compute_inlp_nullspace_projection(
 
     Returns
     -------
-    P : np.ndarray, shape (d_model, d_model), dtype float64
+    P : np.ndarray, shape (d_model, d_model), dtype float32
         Nullspace projection matrix that removes all linearly separable
         refusal-related information found at this (pos, layer).
     """
@@ -315,16 +326,18 @@ def compute_inlp_nullspace_projection(
     harmless_acts = harmless_acts[:n_min, pos_idx, layer, :]  # (n_min, d_model)
 
     Y = np.array([1] * n_min + [0] * n_min, dtype=np.int32)
-    X = torch.cat([harmful_acts, harmless_acts], dim=0).numpy().astype(np.float64)
+    X = torch.cat([harmful_acts, harmless_acts], dim=0).numpy()  # float32
 
     n_val = max(4, int(2 * n_min * val_frac))
     rng   = np.random.default_rng(seed=42)
     idx   = rng.permutation(2 * n_min)
     val_idx, train_idx = idx[:n_val], idx[n_val:]
 
-    P, _, accuracies = _run_inlp_sklearn(
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    P, _, accuracies = _run_inlp(
         X[train_idx], Y[train_idx],
         X[val_idx],   Y[val_idx],
+        device=device,
         n_classifiers=n_classifiers,
         min_accuracy=min_accuracy,
     )
