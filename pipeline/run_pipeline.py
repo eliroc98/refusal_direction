@@ -154,6 +154,8 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9):
     
     # Filter datasets based on refusal scores
     harmful_train, harmless_train, harmful_val, harmless_val = filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val)
+    
+    # For steps 1 and 2, I base the selection on the nullspace projection, and not on the direction learnt by the INPL classifier.
 
     # 1. Generate candidate refusal directions
     # TODO: generate candidate nullspace projections
@@ -167,25 +169,31 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9):
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
     actadd_fwd_pre_hooks, actadd_fwd_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=-1.0))], []
     # TODO: add hooks for nullspace projection intervention
+    # TODO: add actadd hooks but with direction extracted from INLP classifier instead of mean difference direction
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
         generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', dataset_name)
         generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
         generate_and_save_completions_for_dataset(cfg, model_base, actadd_fwd_pre_hooks, actadd_fwd_hooks, 'actadd', dataset_name)
+        # TODO: add completion generation for nullspace projection intervention
+        # TODO: add completion generation for INLP direction intervention
 
-    # 4a. Generate and save completions on harmless evaluation dataset
+    # 4a. Generate and save completions on harmless evaluation dataset (nothing to ablate on because we are working with already harmless samples, so we only do baseline and actadd interventions here)
     harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
 
     generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
 
     actadd_refusal_pre_hooks, actadd_refusal_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=+1.0))], [] #why is the coeff here +1.0? because we want to add the refusal direction to the activations to see if it induces refusals on the harmless dataset, which would indicate that the direction is not perfectly specific to harmful instructions
     generate_and_save_completions_for_dataset(cfg, model_base, actadd_refusal_pre_hooks, actadd_refusal_hooks, 'actadd', 'harmless', dataset=harmless_test)
+    # TODO: add completion generation for INLP direction intervention
 
-    # 5. Evaluate loss on harmless datasets
+    # 5. Evaluate loss on harmless datasets (why is this computed only for the harmless dataset? because we want to check if the interventions increase loss on the harmless dataset, which would indicate that the interventions are not perfectly specific to harmful instructions and may be harming the model's performance on harmless instructions)
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
     evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
     evaluate_loss_for_datasets(cfg, model_base, actadd_fwd_pre_hooks, actadd_fwd_hooks, 'actadd')
+    # TODO: add loss evaluation for nullspace projection intervention
+    # TODO: add loss evaluation for INLP direction intervention
 
     # Free model_base from GPU before loading LlamaGuard2 for evaluation
     model_base.del_model()
@@ -198,10 +206,13 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9):
         evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
         evaluate_completions_and_save_results_for_dataset(cfg, 'ablation', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
         evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
+        # TODO: add evaluation for nullspace projection intervention
+        # TODO: add evaluation for INLP direction intervention
 
     # 4b. Evaluate completions and save results on harmless evaluation dataset
     evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
     evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
+    # TODO: add evaluation for INLP direction intervention
 
 if __name__ == "__main__":
     args = parse_arguments()
