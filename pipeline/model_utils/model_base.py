@@ -24,6 +24,14 @@ class ModelBase(ABC):
     def del_model(self):
         if hasattr(self, 'model') and self.model is not None:
             del self.model
+        # Clear module reference lists — they hold refs to model submodules
+        # and prevent GPU memory from being freed.
+        if hasattr(self, 'model_block_modules'):
+            self.model_block_modules = None
+        if hasattr(self, 'model_attn_modules'):
+            self.model_attn_modules = None
+        if hasattr(self, 'model_mlp_modules'):
+            self.model_mlp_modules = None
 
     @abstractmethod
     def _load_model(self, model_name_or_path: str) -> AutoModelForCausalLM:

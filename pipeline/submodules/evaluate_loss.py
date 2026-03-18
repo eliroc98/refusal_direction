@@ -93,10 +93,16 @@ def compute_loss_over_dataset(model, tokenizer, batch_iterator, n_batches=256, f
 
         input_ids = inputs["input_ids"]
 
-        with add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks):
+        with torch.no_grad(), add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks):
             model_outputs = model(**inputs)
 
         logits = model_outputs.logits
+        # Per-layer ablation can destabilize intermediate activations, producing
+        # NaN/inf logits.  Replace NaN with 0 (→ uniform prob) and clamp inf so
+        # log_softmax produces finite values.  The resulting high loss correctly
+        # reflects a broken model.
+        logits = torch.where(torch.isnan(logits), torch.zeros_like(logits), logits)
+        logits = logits.clamp(min=-1e4, max=1e4)
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
         log_probs_for_labels = log_probs[:, :-1].gather(dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
 
@@ -130,9 +136,12 @@ def evaluate_loss(
     n_batches=256,
     max_seq_length=256,
     dataset_labels=["pile", "alpaca", "alpaca_custom_completions"],
-    completions_file_path=None
+    completions_file_path=None,
+    intervention_label: str = "",
 ):
     result = {}
+
+    tag = f" [{intervention_label}]" if intervention_label else ""
 
     for label in dataset_labels:
         if label == 'pile':
@@ -155,7 +164,7 @@ def evaluate_loss(
             raise ValueError(f"Unknown dataset label: {label}")
 
         ce_loss, perplexity, n_tokens = compute_loss_over_dataset(model_base.model, model_base.tokenizer, dataset_iterator, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks, n_batches=n)
-        print(f"{label.upper()} DATASET:")
+        print(f"{label.upper()} DATASET{tag}:")
         print(f"CE loss: {ce_loss.item()}, Perplexity: {perplexity.item()}, N tokens: {n_tokens.item()}")
 
         result[label] = {
