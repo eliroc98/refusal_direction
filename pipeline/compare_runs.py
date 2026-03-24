@@ -21,13 +21,26 @@ PIPELINE_DIR = os.path.dirname(os.path.realpath(__file__))
 GOLD_DIR = os.path.join(PIPELINE_DIR, "gold_runs")
 RUNS_DIR = os.path.join(PIPELINE_DIR, "runs")
 
-EVALUATION_FILES = [
+import glob as _glob
+
+# Core evaluation files that are always present
+_CORE_EVALUATION_FILES = [
     "jailbreakbench_baseline_evaluations.json",
     "jailbreakbench_ablation_evaluations.json",
-    "jailbreakbench_actadd_evaluations.json",
     "harmless_baseline_evaluations.json",
-    "harmless_actadd_evaluations.json",
 ]
+
+def _get_evaluation_files(gold_completions_dir: str) -> list:
+    """Return evaluation file names, including dynamically discovered actadd_c* files."""
+    files = list(_CORE_EVALUATION_FILES)
+    # Discover actadd coefficient sweep files from the gold directory
+    for pattern in ["jailbreakbench_actadd_c*_evaluations.json",
+                    "jailbreakbench_inlp_actadd_c*_evaluations.json",
+                    "harmless_actadd_c*_evaluations.json",
+                    "harmless_inlp_actadd_c*_evaluations.json"]:
+        found = _glob.glob(os.path.join(gold_completions_dir, pattern))
+        files.extend(os.path.basename(f) for f in sorted(found))
+    return files
 
 SCALAR_METRICS = [
     "substring_matching_success_rate",
@@ -180,8 +193,9 @@ def compare_model(model_alias: str, tolerance: float, check_per_item: bool) -> b
         print(f"  [ERROR] New completions directory not found. Has the pipeline run yet?")
         return False
 
+    eval_files = _get_evaluation_files(gold_completions_dir)
     model_ok = True
-    for fname in EVALUATION_FILES:
+    for fname in eval_files:
         gold_path = os.path.join(gold_completions_dir, fname)
         new_path = os.path.join(new_completions_dir, fname)
 

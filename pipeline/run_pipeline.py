@@ -41,6 +41,11 @@ def parse_arguments():
                         help='Run only the inference steps (1-5) and skip the LlamaGuard evaluation. '
                              'Use --resume_from_eval in a separate process to run evaluation afterwards, '
                              'freeing GPU memory between the two phases.')
+    parser.add_argument('--use_existing', action='store_true',
+                        help='Skip direction extraction (steps 1-2) and load pre-computed directions '
+                             'from a previous run (direction.pt, direction_inlp.pt, etc). '
+                             'Re-runs the full intervention sweep (steps 3-5) with normalized '
+                             'directions and coefficient sweep, then evaluation.')
     return parser.parse_args()
 
 def load_and_sample_datasets(cfg):
@@ -232,39 +237,56 @@ def _run_inference(cfg, model_path):
     )
     #TODO: check if direction is not flipped
 
+    # -- Normalize directions for fair comparison ---------------------------------
+    # The diff-in-means direction has arbitrary magnitude; INLP is already ~unit.
+    # We normalize both to unit length and sweep coefficients scaled by the
+    # original diff-in-means norm so that coeff = 1.0 × norm reproduces the
+    # original (un-normalized) actadd behaviour.
+    direction_norm = torch.norm(direction).item()
+    direction_unit = direction / (torch.norm(direction) + 1e-8)
+    inlp_direction_unit = inlp_direction / (torch.norm(inlp_direction) + 1e-8)
+
+    actadd_multipliers = [0.1, 0.5, 1.0, 2.0, 5.0]
+    actadd_coeffs = [m * direction_norm for m in actadd_multipliers]
+    print(f"Direction norm (diff-in-means): {direction_norm:.4f}")
+    print(f"ActAdd coefficient sweep: {[f'{c:.2f}' for c in actadd_coeffs]}")
+
+    # Persist coefficients so _run_evaluation can discover them
+    with open(os.path.join(cfg.artifact_path(), 'actadd_coeffs.json'), 'w') as f:
+        json.dump({"direction_norm": direction_norm, "multipliers": actadd_multipliers, "coeffs": actadd_coeffs}, f, indent=2)
+
     # -- Build intervention hooks --------------------------------------------------
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
 
-    # Mean-difference direction: ablate across all layers / actadd at selected layer
+    # Mean-difference direction: ablation across all layers (self-normalizes, uses raw direction)
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
-    actadd_fwd_pre_hooks, actadd_fwd_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=-1.0))], []
 
     # INLP nullspace projection: applied only at the layer from which P was extracted
     nullspace_fwd_pre_hooks, nullspace_fwd_hooks = [
         (model_base.model_block_modules[inlp_layer],
          get_nullspace_projection_input_pre_hook(P))
     ], []
-    
-    #TODO: ablate INLP direction
-
-    # INLP first direction: actadd at the selected INLP layer (coeff=-1 to jailbreak)
-    inlp_actadd_fwd_pre_hooks, inlp_actadd_fwd_hooks = [
-        (model_base.model_block_modules[inlp_layer],
-         get_activation_addition_input_pre_hook(vector=inlp_direction, coeff=-1.0))
-    ], []
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
         generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', dataset_name)
         generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
-        generate_and_save_completions_for_dataset(cfg, model_base, actadd_fwd_pre_hooks, actadd_fwd_hooks, 'actadd', dataset_name)
 
         # Nullspace projection intervention (applied at the INLP source layer only)
         generate_and_save_completions_for_dataset(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace', dataset_name)
 
-        # INLP first-direction actadd (discriminatively trained direction)
-        generate_and_save_completions_for_dataset(cfg, model_base, inlp_actadd_fwd_pre_hooks, inlp_actadd_fwd_hooks, 'inlp_actadd', dataset_name)
+        # Sweep coefficients for both mean-diff and INLP actadd (unit-normalized directions)
+        for coeff in actadd_coeffs:
+            label = f'actadd_c{coeff:.2f}'
+            hooks_pre = [(model_base.model_block_modules[layer],
+                          get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
+            generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, dataset_name)
+
+            inlp_label = f'inlp_actadd_c{coeff:.2f}'
+            inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
+                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+            generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
 
     # 4a. Generate and save completions on harmless evaluation dataset
     #     (We test whether each intervention INDUCES refusal on harmless prompts,
@@ -275,40 +297,43 @@ def _run_inference(cfg, model_path):
 
     generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
 
-    # Mean-diff actadd with coeff=+1.0: add refusal direction to check induction
-    actadd_refusal_pre_hooks, actadd_refusal_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=+1.0))], []
-    generate_and_save_completions_for_dataset(cfg, model_base, actadd_refusal_pre_hooks, actadd_refusal_hooks, 'actadd', 'harmless', dataset=harmless_test)
+    # Sweep coefficients: add refusal direction (+coeff) to harmless prompts
+    for coeff in actadd_coeffs:
+        label = f'actadd_c{coeff:.2f}'
+        hooks_pre = [(model_base.model_block_modules[layer],
+                      get_activation_addition_input_pre_hook(vector=direction_unit, coeff=+coeff))]
+        generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, 'harmless', dataset=harmless_test)
 
-    # INLP actadd with coeff=+1.0: add INLP direction to check refusal induction
-    inlp_actadd_refusal_pre_hooks, inlp_actadd_refusal_hooks = [
-        (model_base.model_block_modules[inlp_layer],
-         get_activation_addition_input_pre_hook(vector=inlp_direction, coeff=+1.0))
-    ], []
-    generate_and_save_completions_for_dataset(cfg, model_base, inlp_actadd_refusal_pre_hooks, inlp_actadd_refusal_hooks, 'inlp_actadd', 'harmless', dataset=harmless_test)
+        inlp_label = f'inlp_actadd_c{coeff:.2f}'
+        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
+                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
+        generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
 
     # 5. Evaluate loss on harmless datasets for all interventions
     #    (checks whether interventions degrade performance on benign prompts)
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
     evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
-    evaluate_loss_for_datasets(cfg, model_base, actadd_fwd_pre_hooks, actadd_fwd_hooks, 'actadd')
-
-    # Nullspace projection loss (should have low impact on harmless perplexity)
     evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
 
-    # INLP actadd loss
-    evaluate_loss_for_datasets(cfg, model_base, inlp_actadd_fwd_pre_hooks, inlp_actadd_fwd_hooks, 'inlp_actadd')
+    # Sweep coefficients for loss evaluation
+    for coeff in actadd_coeffs:
+        label = f'actadd_c{coeff:.2f}'
+        hooks_pre = [(model_base.model_block_modules[layer],
+                      get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
+        evaluate_loss_for_datasets(cfg, model_base, hooks_pre, [], label)
+
+        inlp_label = f'inlp_actadd_c{coeff:.2f}'
+        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
+                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+        evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
 
     # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
     model_base.del_model()
     del model_base
-    del candidate_directions, direction, inlp_direction, P
+    del candidate_directions, direction, direction_unit, inlp_direction, inlp_direction_unit, P
     del baseline_fwd_pre_hooks, baseline_fwd_hooks
     del ablation_fwd_pre_hooks, ablation_fwd_hooks
-    del actadd_fwd_pre_hooks, actadd_fwd_hooks
     del nullspace_fwd_pre_hooks, nullspace_fwd_hooks
-    del inlp_actadd_fwd_pre_hooks, inlp_actadd_fwd_hooks
-    del actadd_refusal_pre_hooks, actadd_refusal_hooks
-    del inlp_actadd_refusal_pre_hooks, inlp_actadd_refusal_hooks
 
     gc.collect()
     if torch.cuda.is_available():
@@ -329,36 +354,174 @@ def _run_evaluation(cfg):
     if "llamaguard2" in cfg.jailbreak_eval_methodologies:
         lg2_classifier = LlamaGuard2Classifier(gpu_memory_utilization=cfg.vllm_gpu_memory_utilization)
 
+    # Load coefficient sweep from inference stage
+    coeffs_path = os.path.join(cfg.artifact_path(), 'actadd_coeffs.json')
+    with open(coeffs_path, 'r') as f:
+        actadd_coeffs = json.load(f)["coeffs"]
+
     # 3b. Evaluate completions and save results on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
         evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
         evaluate_completions_and_save_results_for_dataset(cfg, 'ablation', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
-        evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
 
         # Nullspace projection evaluation
         evaluate_completions_and_save_results_for_dataset(cfg, 'nullspace', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
 
-        # INLP actadd evaluation
-        evaluate_completions_and_save_results_for_dataset(cfg, 'inlp_actadd', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
+        # Sweep coefficients for mean-diff and INLP actadd
+        for coeff in actadd_coeffs:
+            evaluate_completions_and_save_results_for_dataset(cfg, f'actadd_c{coeff:.2f}', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
+            evaluate_completions_and_save_results_for_dataset(cfg, f'inlp_actadd_c{coeff:.2f}', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
 
     # 4b. Evaluate completions and save results on harmless evaluation dataset
     evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
-    evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
 
-    # INLP actadd harmless evaluation
-    evaluate_completions_and_save_results_for_dataset(cfg, 'inlp_actadd', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
+    for coeff in actadd_coeffs:
+        evaluate_completions_and_save_results_for_dataset(cfg, f'actadd_c{coeff:.2f}', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
+        evaluate_completions_and_save_results_for_dataset(cfg, f'inlp_actadd_c{coeff:.2f}', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
 
     # Clean up the LlamaGuard2 classifier
     if lg2_classifier is not None:
         lg2_classifier.cleanup()
 
 
+def _run_inference_from_existing(cfg, model_path):
+    """Re-run interventions (steps 3-5) using pre-computed directions.
+
+    Loads saved direction.pt, direction_inlp.pt, nullspace_projection.npy, and
+    metadata from a previous run.  Skips direction extraction (steps 1-2) and
+    jumps straight to the coefficient sweep, completions, and loss evaluation.
+    """
+    import numpy as np
+
+    artifact_path = cfg.artifact_path()
+
+    # --- Load pre-computed directions and metadata ---
+    direction = torch.load(os.path.join(artifact_path, 'direction.pt'),
+                           map_location='cpu', weights_only=True)
+    with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
+        meta = json.load(f)
+    pos, layer = meta["pos"], meta["layer"]
+
+    inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'),
+                                map_location='cpu', weights_only=True)
+    with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
+        inlp_meta = json.load(f)
+    inlp_pos, inlp_layer = inlp_meta["pos"], inlp_meta["layer"]
+
+    P = np.load(os.path.join(artifact_path, 'nullspace_projection.npy'))
+
+    print(f"Loaded directions from {artifact_path}")
+    print(f"  diff-in-means: pos={pos}, layer={layer}, norm={torch.norm(direction).item():.4f}")
+    print(f"  INLP:          pos={inlp_pos}, layer={inlp_layer}, norm={torch.norm(inlp_direction).item():.4f}")
+
+    # --- Load model ---
+    model_base = construct_model_base(cfg.model_path, device=cfg.device)
+
+    # -- Normalize directions for fair comparison ---------------------------------
+    direction_norm = torch.norm(direction).item()
+    direction_unit = direction / (torch.norm(direction) + 1e-8)
+    inlp_direction_unit = inlp_direction / (torch.norm(inlp_direction) + 1e-8)
+
+    actadd_multipliers = [0.1, 0.5, 1.0, 2.0, 5.0]
+    actadd_coeffs = [m * direction_norm for m in actadd_multipliers]
+    print(f"Direction norm (diff-in-means): {direction_norm:.4f}")
+    print(f"ActAdd coefficient sweep: {[f'{c:.2f}' for c in actadd_coeffs]}")
+
+    # Persist coefficients so _run_evaluation can discover them
+    with open(os.path.join(cfg.artifact_path(), 'actadd_coeffs.json'), 'w') as f:
+        json.dump({"direction_norm": direction_norm, "multipliers": actadd_multipliers, "coeffs": actadd_coeffs}, f, indent=2)
+
+    # -- Build intervention hooks --------------------------------------------------
+
+    baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
+
+    # Mean-difference direction: ablation across all layers (self-normalizes, uses raw direction)
+    ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
+
+    # INLP nullspace projection: applied only at the layer from which P was extracted
+    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = [
+        (model_base.model_block_modules[inlp_layer],
+         get_nullspace_projection_input_pre_hook(P))
+    ], []
+
+    # 3a. Generate and save completions on harmful evaluation datasets
+    for dataset_name in cfg.evaluation_datasets:
+        generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', dataset_name)
+        generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
+
+        # Nullspace projection intervention (applied at the INLP source layer only)
+        generate_and_save_completions_for_dataset(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace', dataset_name)
+
+        # Sweep coefficients for both mean-diff and INLP actadd (unit-normalized directions)
+        for coeff in actadd_coeffs:
+            label = f'actadd_c{coeff:.2f}'
+            hooks_pre = [(model_base.model_block_modules[layer],
+                          get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
+            generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, dataset_name)
+
+            inlp_label = f'inlp_actadd_c{coeff:.2f}'
+            inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
+                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+            generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
+
+    # 4a. Generate and save completions on harmless evaluation dataset
+    harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
+
+    generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
+
+    # Sweep coefficients: add refusal direction (+coeff) to harmless prompts
+    for coeff in actadd_coeffs:
+        label = f'actadd_c{coeff:.2f}'
+        hooks_pre = [(model_base.model_block_modules[layer],
+                      get_activation_addition_input_pre_hook(vector=direction_unit, coeff=+coeff))]
+        generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, 'harmless', dataset=harmless_test)
+
+        inlp_label = f'inlp_actadd_c{coeff:.2f}'
+        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
+                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
+        generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
+
+    # 5. Evaluate loss on harmless datasets for all interventions
+    evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
+    evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
+    evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
+
+    for coeff in actadd_coeffs:
+        label = f'actadd_c{coeff:.2f}'
+        hooks_pre = [(model_base.model_block_modules[layer],
+                      get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
+        evaluate_loss_for_datasets(cfg, model_base, hooks_pre, [], label)
+
+        inlp_label = f'inlp_actadd_c{coeff:.2f}'
+        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
+                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+        evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
+
+    # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
+    model_base.del_model()
+    del model_base
+    del direction, direction_unit, inlp_direction, inlp_direction_unit, P
+    del baseline_fwd_pre_hooks, baseline_fwd_hooks
+    del ablation_fwd_pre_hooks, ablation_fwd_hooks
+    del nullspace_fwd_pre_hooks, nullspace_fwd_hooks
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
-                 resume_from_eval=False, skip_eval=False):
+                 resume_from_eval=False, skip_eval=False, use_existing=False):
     """Run the full pipeline."""
     model_alias = os.path.basename(model_path)
     cfg = Config(model_alias=model_alias, model_path=model_path, device=device,
                  vllm_gpu_memory_utilization=vllm_gpu_memory_utilization)
+
+    if use_existing:
+        _run_inference_from_existing(cfg, model_path)
+        if not skip_eval:
+            _run_evaluation(cfg)
+        return
 
     if not resume_from_eval:
         _run_inference(cfg, model_path)
@@ -372,4 +535,5 @@ if __name__ == "__main__":
     run_pipeline(model_path=args.model_path, device=args.device,
                  vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                  resume_from_eval=args.resume_from_eval,
-                 skip_eval=args.skip_eval)
+                 skip_eval=args.skip_eval,
+                 use_existing=args.use_existing)
