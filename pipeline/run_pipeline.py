@@ -235,7 +235,6 @@ def _run_inference(cfg, model_path):
     inlp_pos, inlp_layer, inlp_direction, P = select_and_save_direction_inlp(
         cfg, model_base, harmful_val, harmless_val, n_classifiers=20
     )
-    #TODO: check if direction is not flipped
 
     # -- Normalize directions for fair comparison ---------------------------------
     # The diff-in-means direction has arbitrary magnitude; INLP is already ~unit.
