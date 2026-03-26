@@ -1,0 +1,25 @@
+Pseudo code for how to rank and select components
+
+Inputs:
+- k = # of components to which apply the final intervention to
+- direction multipliers: to make INLP and diff in means comparable, the interventions using steering (thus not the projection and ablations) must apply the direction using the same magnitude
+
+Code:
+1. Score interventions based on the steering score, KL div score and refusal score. These interventions must be applied to
+1.1. In the diff in means case, all components. In particular, the same intervention (ablation with the same direction) is applied to all components
+1.2. In the INLP case, just the component from which the intervention (nullspace projection) has been extracted from
+
+However, I would prefer applying the same logic to both cases (applying intervention to just the component from which it has been extracted from). To do this, I must make sure first that I get the same scoring for the diff in means case whether I apply the intervention to all components or to just the source one. I need to get the scoring for these two cases and, if the ranking remain the same, then I can safely switch from ranking by intervening on all components to ranking by intervening on the source component.
+
+In the computation of refusal scores, one must take into account the median effect considering all multipliers. INLP experiments must be perfomed after because they need to know the norm of the direction used in the diff in means interventions.
+
+Update: I saw that local and global rankings are not that different. I can switch to local rankings. I want the code for computing the comparison to be isolated and run just when asked. Default ranking behavour should change to local-based.
+
+2. After the selection, at inference time, rank ALL the components by the scores, without filtering them. (indeed this could already be done during the selection procedure)
+2.1. in the diff in means case, select the best intervention (direction) and apply it to the top k components. All interventions are the same (TODO in the future: consider applying different interventions like in the INLP case)
+2.2. in the INLP case, apply the nullspace projection interventions on the top k components. Each component will be affected by the projection extracted from itself (not the same intervention for all components) (TODO in the fuure> consider applying the same intervention like in the diff in means case)
+
+Limitations:
+- In this selection procedure, the composition effect is not considered. It might be that the effect of later interventions is not the same given the fact that previous components have been subject to interventions as well.
+
+- In the current setting, it could be that the diff in means interventions are not comparable to INLP, because the latter interventions are depending on the component onto which they are (extracted and) applied.
