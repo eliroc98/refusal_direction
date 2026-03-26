@@ -25,8 +25,18 @@ from jaxtyping import Float
 from torch import Tensor
 from tqdm import tqdm
 
-from pipeline.utils.hook_utils import add_hooks, get_nullspace_projection_input_pre_hook
+from pipeline.utils.hook_utils import add_hooks, get_nullspace_projection_input_pre_hook, get_activation_addition_input_pre_hook
 from pipeline.model_utils.model_base import ModelBase
+
+
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _split_train_val(n_samples: int, val_frac: float = 0.2, seed: int = 42):
+    """Split indices into train/val sets (deterministic)."""
+    n_val = max(4, int(n_samples * val_frac))
+    rng = np.random.default_rng(seed=seed)
+    idx = rng.permutation(n_samples)
+    return idx[n_val:], idx[:n_val]
 
 
 # ─── INLP core ────────────────────────────────────────────────────────────────
@@ -179,12 +189,16 @@ def generate_directions_inlp(
     harmless_instructions: List[str],
     artifact_dir: str,
     batch_size: int = 32,
+    n_classifiers: int = 20,
+    min_accuracy: float = 0.55,
+    val_frac: float = 0.2,
 ) -> None:
-    """Extract and cache activations for later INLP direction finding.
+    """Extract activations and compute INLP for all (pos, layer) pairs.
 
-    Saves ``harmful_activations.pt`` and ``harmless_activations.pt`` to
-    ``artifact_dir`` so that ``compute_inlp_nullspace_projection`` and
-    ``select_direction_inlp`` can reuse them without re-running the model.
+    Saves to ``artifact_dir``:
+      - ``harmful_activations.pt`` / ``harmless_activations.pt`` (raw activations)
+      - ``inlp_results.pt`` — per-(pos, layer) nullspace projection P,
+        first classifier direction, and accuracies.
     """
     os.makedirs(artifact_dir, exist_ok=True)
 
@@ -204,8 +218,56 @@ def generate_directions_inlp(
         batch_size=batch_size, positions=positions,
     )   # (n_harmless, n_pos, n_layers, d_model)
 
-    torch.save(harmful_acts,  os.path.join(artifact_dir, "harmful_activations.pt"))
+    # Save raw activations (backward compat)
+    torch.save(harmful_acts, os.path.join(artifact_dir, "harmful_activations.pt"))
     torch.save(harmless_acts, os.path.join(artifact_dir, "harmless_activations.pt"))
+
+    # Run INLP for every (pos, layer) pair
+    n_pos = len(positions)
+    n_layers = model_base.model.config.num_hidden_layers
+    n_min = min(harmful_acts.shape[0], harmless_acts.shape[0])
+    harmful_acts = harmful_acts[:n_min]
+    harmless_acts = harmless_acts[:n_min]
+
+    Y = np.array([1] * n_min + [0] * n_min, dtype=np.int32)
+    train_idx, val_idx = _split_train_val(2 * n_min, val_frac=val_frac)
+
+    device = next(model_base.model.parameters()).device
+    inlp_params = {}
+
+    for pos_idx in range(n_pos):
+        src_pos = pos_idx - n_pos
+        for layer_idx in tqdm(range(n_layers),
+                               desc=f"INLP generate (pos {src_pos})"):
+            X = torch.cat([
+                harmful_acts[:, pos_idx, layer_idx, :],
+                harmless_acts[:, pos_idx, layer_idx, :],
+            ], dim=0).numpy()
+
+            P, first_dir, accuracies = _run_inlp(
+                X[train_idx], Y[train_idx],
+                X[val_idx], Y[val_idx],
+                device=device,
+                n_classifiers=n_classifiers,
+                min_accuracy=min_accuracy,
+            )
+
+            inlp_params[f"({pos_idx}, {layer_idx})"] = {
+                "P": P,
+                "first_dir": first_dir.squeeze() if first_dir is not None else None,
+                "accuracies": accuracies,
+            }
+
+    results = {
+        "inlp_params": inlp_params,
+        "positions": positions,
+        "n_layers": n_layers,
+        "n_classifiers": n_classifiers,
+        "min_accuracy": min_accuracy,
+        "val_frac": val_frac,
+    }
+    torch.save(results, os.path.join(artifact_dir, "inlp_results.pt"))
+    print(f"INLP: saved results for {len(inlp_params)} (pos, layer) pairs to {artifact_dir}/inlp_results.pt")
 
 
 # ─── Nullspace projection for selected (pos, layer) ──────────────────────────
@@ -215,14 +277,8 @@ def compute_inlp_nullspace_projection(
     model_base: ModelBase,
     pos: int,
     layer: int,
-    n_classifiers: int = 20,
-    min_accuracy: float = 0.55,
-    val_frac: float = 0.2,
 ) -> np.ndarray:
-    """Run full INLP for the selected (pos, layer) and return the nullspace P.
-
-    Loads activations saved by ``generate_directions_inlp`` to avoid re-running
-    the model.
+    """Load the pre-computed nullspace projection P for the given (pos, layer).
 
     Parameters
     ----------
@@ -230,8 +286,6 @@ def compute_inlp_nullspace_projection(
         Negative position index (e.g. -1 for last EOI token).
     layer : int
         Layer index (0-indexed).
-    n_classifiers : int
-        Maximum number of INLP iterations (directions to remove).
 
     Returns
     -------
@@ -239,84 +293,61 @@ def compute_inlp_nullspace_projection(
         Nullspace projection matrix that removes all linearly separable
         refusal-related information found at this (pos, layer).
     """
-    harmful_path  = os.path.join(artifact_dir, "harmful_activations.pt")
-    harmless_path = os.path.join(artifact_dir, "harmless_activations.pt")
-
-    if not (os.path.exists(harmful_path) and os.path.exists(harmless_path)):
+    results_path = os.path.join(artifact_dir, "inlp_results.pt")
+    if not os.path.exists(results_path):
         raise FileNotFoundError(
-            f"Activation files not found in {artifact_dir}. "
+            f"INLP results not found at {results_path}. "
             "Run generate_directions_inlp first."
         )
 
-    harmful_acts  = torch.load(harmful_path,  map_location="cpu")
-    harmless_acts = torch.load(harmless_path, map_location="cpu")
+    results = torch.load(results_path, map_location="cpu")
+    positions = results["positions"]
+    n_pos = len(positions)
+    pos_idx = pos + n_pos  # e.g. pos=-1, n_pos=2 → pos_idx=1
 
-    # Convert negative pos to list index
-    positions = list(range(-len(model_base.eoi_toks), 0))
-    n_pos     = len(positions)
-    pos_idx   = pos + n_pos   # e.g. pos=-1, n_pos=2 → pos_idx=1
+    key = f"({pos_idx}, {layer})"
+    if key not in results["inlp_params"]:
+        raise KeyError(f"No INLP result for pos_idx={pos_idx}, layer={layer}")
 
-    n_min = min(harmful_acts.shape[0], harmless_acts.shape[0])
-    harmful_acts  = harmful_acts[:n_min,  pos_idx, layer, :]  # (n_min, d_model)
-    harmless_acts = harmless_acts[:n_min, pos_idx, layer, :]  # (n_min, d_model)
-
-    Y = np.array([1] * n_min + [0] * n_min, dtype=np.int32)
-    X = torch.cat([harmful_acts, harmless_acts], dim=0).numpy()  # float32
-
-    n_val = max(4, int(2 * n_min * val_frac))
-    rng   = np.random.default_rng(seed=42)
-    idx   = rng.permutation(2 * n_min)
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    P, _, accuracies = _run_inlp(
-        X[train_idx], Y[train_idx],
-        X[val_idx],   Y[val_idx],
-        device=device,
-        n_classifiers=n_classifiers,
-        min_accuracy=min_accuracy,
-    )
-
+    entry = results["inlp_params"][key]
+    accuracies = entry["accuracies"]
     print(
         f"Nullspace projection: {len(accuracies)} classifiers removed, "
         f"accuracies: {[f'{a:.3f}' for a in accuracies]}"
     )
 
-    return P
+    return entry["P"]
 
 
 # ─── Direction selection via nullspace projection effect ──────────────────────
 
-def select_direction_inlp(
+def select_direction_inlp_ranked(
     artifact_dir: str,
     model_base: ModelBase,
     harmful_instructions: List[str],
     harmless_instructions: List[str],
-    n_classifiers: int = 20,
-    min_accuracy: float = 0.55,
-    val_frac: float = 0.2,
+    actadd_multipliers: list,
+    direction_norm: float,
     kl_threshold: Optional[float] = 0.1,
     prune_layer_percentage: float = 0.20,
     batch_size: int = 32,
-) -> Tuple[int, int, np.ndarray, np.ndarray]:
-    """Select the best (pos, layer) for INLP using nullspace projection effect.
+) -> List[dict]:
+    """Select the best (pos, layer) for INLP using actadd-median refusal scoring.
 
-    For each (pos, layer) pair, runs full INLP to obtain a nullspace projection
-    matrix P, then measures how much P reduces refusal on harmful instructions.
-    The (pos, layer) with the highest steering score (= baseline_refusal -
-    projected_refusal) is selected.  The first INLP classifier direction from
-    that winning run is returned as the representative direction for downstream
-    activation-addition analysis.
-
-    Loads activations cached by generate_directions_inlp.
+    Loads pre-computed INLP results from ``inlp_results.pt`` (saved by
+    ``generate_directions_inlp``), then scores each (pos, layer) by sweeping
+    actadd multipliers scaled by ``direction_norm`` (from the top mean-diff
+    direction) and taking the median refusal score.
 
     Parameters
     ----------
     artifact_dir : str
-        Directory with 'harmful_activations.pt' and 'harmless_activations.pt'
-        saved by generate_directions_inlp.
-    n_classifiers : int
-        Maximum INLP iterations per (pos, layer).
+        Directory with ``inlp_results.pt`` saved by ``generate_directions_inlp``.
+    actadd_multipliers : list
+        Multipliers for the actadd coefficient sweep.
+    direction_norm : float
+        Norm of the top mean-diff direction, used to scale INLP actadd
+        coefficients for fair comparison.
     kl_threshold : float or None
         Reject (pos, layer) if the KL divergence between baseline and P-projected
         harmless logits exceeds this value.  None disables KL filtering.
@@ -325,47 +356,41 @@ def select_direction_inlp(
 
     Returns
     -------
-    pos : int  (negative index)
-    layer : int
-    first_dir : np.ndarray, shape (d_model,)  — unit direction from best run
-    P : np.ndarray, shape (d_model, d_model)  — nullspace projection from best run
+    tuple[list[dict], list[dict]]
+        ``(all_scores, filtered_scores)`` — both ranked by sorting_score.
+        All entries carry first_dir and P.  ``all_scores`` is the full
+        unfiltered pool (for top-k layer selection); ``filtered_scores``
+        is the filtered pool (for best direction selection).
     """
     import json as _json
     from pipeline.submodules.select_direction import (
-        get_refusal_scores, kl_div_fn, get_last_position_logits,
+        get_refusal_scores, kl_div_fn, get_last_position_logits, filter_fn, plot_refusal_scores,
     )
 
-    harmful_path  = os.path.join(artifact_dir, "harmful_activations.pt")
-    harmless_path = os.path.join(artifact_dir, "harmless_activations.pt")
-
-    if not (os.path.exists(harmful_path) and os.path.exists(harmless_path)):
+    results_path = os.path.join(artifact_dir, "inlp_results.pt")
+    if not os.path.exists(results_path):
         raise FileNotFoundError(
-            f"Activation files not found in {artifact_dir}. "
+            f"INLP results not found at {results_path}. "
             "Run generate_directions_inlp first."
         )
 
-    harmful_acts  = torch.load(harmful_path,  map_location="cpu")
-    harmless_acts = torch.load(harmless_path, map_location="cpu")
-
-    positions = list(range(-len(model_base.eoi_toks), 0))
-    n_pos     = len(positions)
-    n_layers  = model_base.model.config.num_hidden_layers
-
-    n_min = min(harmful_acts.shape[0], harmless_acts.shape[0])
-    harmful_acts  = harmful_acts[:n_min]
-    harmless_acts = harmless_acts[:n_min]
-
-    Y = np.array([1] * n_min + [0] * n_min, dtype=np.int32)
-    n_val = max(4, int(2 * n_min * val_frac))
-    rng   = np.random.default_rng(seed=42)
-    idx   = rng.permutation(2 * n_min)
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
+    results = torch.load(results_path, map_location="cpu")
+    inlp_params = results["inlp_params"]
+    positions = results["positions"]
+    n_pos = len(positions)
+    n_layers = results["n_layers"]
 
     device = model_base.model.device
 
-    # Baseline refusal score on harmful instructions (no intervention)
-    baseline_refusal = get_refusal_scores(
+    # Baselines for reporting and filtering parity with mean-diff selection.
+    baseline_refusal_harmful = get_refusal_scores(
         model_base.model, harmful_instructions,
+        model_base.tokenize_instructions_fn, model_base.refusal_toks,
+        batch_size=batch_size,
+    ).mean().item()
+
+    baseline_refusal_harmless = get_refusal_scores(
+        model_base.model, harmless_instructions,
         model_base.tokenize_instructions_fn, model_base.refusal_toks,
         batch_size=batch_size,
     ).mean().item()
@@ -381,13 +406,13 @@ def select_direction_inlp(
             batch_size=batch_size,
         )
 
-    best_steering_score = float('-inf')
-    best_pos       = None
-    best_layer     = None
-    best_first_dir = None
-    best_P         = None
-
     all_scores: list = []
+    filtered_scores: list = []
+
+    # Score tensors for plotting (NaN = pruned/missing)
+    plot_refusal_scores_tensor = torch.full((n_pos, n_layers), float('nan'))
+    plot_steering_scores_tensor = torch.full((n_pos, n_layers), float('nan'))
+    plot_kl_div_scores_tensor = torch.full((n_pos, n_layers), float('nan'))
 
     for pos_idx in range(n_pos):
         src_pos = pos_idx - n_pos  # convert to negative index
@@ -398,86 +423,205 @@ def select_direction_inlp(
                     and layer_idx >= int(n_layers * (1.0 - prune_layer_percentage))):
                 continue
 
-            X = torch.cat([
-                harmful_acts[:,  pos_idx, layer_idx, :],
-                harmless_acts[:, pos_idx, layer_idx, :],
-            ], dim=0).numpy()  # (2*n_min, d_model), float32
+            key = f"({pos_idx}, {layer_idx})"
+            if key not in inlp_params:
+                continue
 
-            P, first_dir, accuracies = _run_inlp(
-                X[train_idx], Y[train_idx],
-                X[val_idx],   Y[val_idx],
-                device=device,
-                n_classifiers=n_classifiers,
-                min_accuracy=min_accuracy,
-            )
+            entry = inlp_params[key]
+            P = entry["P"]
+            first_dir = entry["first_dir"]
+            accuracies = entry["accuracies"]
 
             if first_dir is None or len(accuracies) == 0:
-                continue  # no classifier exceeded min_accuracy
+                continue
 
-            # Score: apply P only at the source layer (mirrors how select_direction
-            # scores activation addition — single layer, not global).  Avoids the
-            # compounding KL distortion that results from applying P at every layer.
-            fwd_pre_hooks = [(model_base.model_block_modules[layer_idx],
-                              get_nullspace_projection_input_pre_hook(P))]
-            fwd_hooks = []
-            projected_refusal = get_refusal_scores(
+            # Refusal score: nullspace projection P on harmful
+            nullspace_hooks = [(model_base.model_block_modules[layer_idx],
+                                get_nullspace_projection_input_pre_hook(P))]
+            refusal_score = get_refusal_scores(
                 model_base.model, harmful_instructions,
                 model_base.tokenize_instructions_fn, model_base.refusal_toks,
-                fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
+                fwd_pre_hooks=nullspace_hooks, fwd_hooks=[],
                 batch_size=batch_size,
             ).mean().item()
 
-            # Higher steering_score = P suppresses more refusal = better direction
-            steering_score = baseline_refusal - projected_refusal
+            # Normalize INLP direction to unit and use direction_norm for fair scaling
+            first_dir_tensor = torch.from_numpy(first_dir.squeeze()).float()
+            first_dir_norm = torch.norm(first_dir_tensor).item()
+            first_dir_unit = first_dir_tensor / (first_dir_norm + 1e-8)
 
-            # KL filtering: reject if P distorts harmless generations too much
-            if kl_threshold is not None and baseline_harmless_logits is not None:
+            # Steering score: median actadd on harmless, sweep multipliers * direction_norm
+            per_mult_scores = []
+            for m in actadd_multipliers:
+                coeff = m * direction_norm  # positive: induce refusal on harmless
+                fwd_pre_hooks = [(model_base.model_block_modules[layer_idx],
+                                  get_activation_addition_input_pre_hook(
+                                      vector=first_dir_unit, coeff=coeff))]
+
+                scores = get_refusal_scores(
+                    model_base.model, harmless_instructions,
+                    model_base.tokenize_instructions_fn, model_base.refusal_toks,
+                    fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=[],
+                    batch_size=batch_size,
+                )
+                per_mult_scores.append(scores.mean().item())
+
+            steering_score = float(torch.tensor(per_mult_scores).max())
+
+            # KL filtering: apply nullspace projection P, measure distortion on harmless
+            nullspace_fwd_pre_hooks = [(model_base.model_block_modules[layer_idx],
+                                        get_nullspace_projection_input_pre_hook(P))]
+            kl = 0.0
+            if baseline_harmless_logits is not None:
                 intervention_logits = get_last_position_logits(
                     model=model_base.model,
                     tokenizer=model_base.tokenizer,
                     instructions=harmless_instructions,
                     tokenize_instructions_fn=model_base.tokenize_instructions_fn,
-                    fwd_pre_hooks=fwd_pre_hooks,
-                    fwd_hooks=fwd_hooks,
+                    fwd_pre_hooks=nullspace_fwd_pre_hooks,
+                    fwd_hooks=[],
                     batch_size=batch_size,
                 )
-                import math as _math
                 kl = kl_div_fn(
                     baseline_harmless_logits, intervention_logits, mask=None
                 ).mean().item()
-                if _math.isnan(kl) or kl > kl_threshold:
-                    continue
 
-            all_scores.append({
-                'pos': src_pos,
+            row = {
+                'position': src_pos,
                 'layer': layer_idx,
+                'refusal_score': refusal_score,
                 'steering_score': steering_score,
-                'projected_refusal': projected_refusal,
+                'kl_div_score': kl,
                 'n_classifiers': len(accuracies),
-            })
+                'sorting_score': -refusal_score,
+                'first_dir': first_dir.squeeze().copy(),
+                'P': P.copy(),
+            }
 
-            if steering_score > best_steering_score:
-                best_steering_score = steering_score
-                best_pos       = src_pos
-                best_layer     = layer_idx
-                best_first_dir = first_dir.squeeze()   # (d_model,)
-                best_P         = P
+            all_scores.append(row)
+            plot_refusal_scores_tensor[pos_idx, layer_idx] = refusal_score
+            plot_steering_scores_tensor[pos_idx, layer_idx] = steering_score
+            plot_kl_div_scores_tensor[pos_idx, layer_idx] = kl
 
-    if best_pos is None:
-        raise RuntimeError(
-            "INLP selection: no valid direction found at any (pos, layer). "
-            "Consider relaxing kl_threshold or prune_layer_percentage."
+            discard_direction = filter_fn(
+                refusal_score=refusal_score,
+                steering_score=steering_score,
+                kl_div_score=kl,
+                layer=layer_idx,
+                n_layer=n_layers,
+                kl_threshold=kl_threshold,
+                induce_refusal_threshold=0.0,
+                prune_layer_percentage=prune_layer_percentage,
+            )
+
+            if not discard_direction:
+                filtered_scores.append(row)
+
+    token_labels = model_base.tokenizer.batch_decode(model_base.eoi_toks)
+    plot_refusal_scores(
+        refusal_scores=plot_refusal_scores_tensor,
+        baseline_refusal_score=baseline_refusal_harmful,
+        token_labels=token_labels,
+        title='INLP: nullspace projection refusal on harmful instructions',
+        artifact_dir=artifact_dir,
+        artifact_name='inlp_refusal_scores',
+    )
+    plot_refusal_scores(
+        refusal_scores=plot_steering_scores_tensor,
+        baseline_refusal_score=baseline_refusal_harmless,
+        token_labels=token_labels,
+        title=f'INLP: steering median on harmless instructions (multipliers={actadd_multipliers})',
+        artifact_dir=artifact_dir,
+        artifact_name='inlp_steering_median_scores',
+    )
+    plot_refusal_scores(
+        refusal_scores=plot_kl_div_scores_tensor,
+        baseline_refusal_score=0.0,
+        token_labels=token_labels,
+        title='INLP: KL divergence (nullspace projection on harmless)',
+        artifact_dir=artifact_dir,
+        artifact_name='inlp_kl_div_scores',
+    )
+    all_scores.sort(key=lambda x: (-x['sorting_score'], x['position'], x['layer']))
+    if len(filtered_scores) == 0:
+        if len(all_scores) == 0:
+            print("WARNING: No valid INLP direction found at any (pos, layer). INLP interventions will be skipped.")
+            return all_scores, []
+
+        # Fallback: select the best available INLP direction from the unfiltered pool
+        # using composite ranking: lowest refusal score, lowest KL, highest steering.
+        print("WARNING: No INLP direction passed filtering. Falling back to best unfiltered direction.")
+        print(f"  • kl_threshold={kl_threshold}: {sum(1 for x in all_scores if x['kl_div_score'] > kl_threshold)} directions exceed KL limit")
+        print(f"  • prune_layer_percentage={prune_layer_percentage}: {sum(1 for x in all_scores if x['layer'] >= int(n_layers * (1.0 - prune_layer_percentage)))} directions in pruned layers")
+
+        # Rank by: lowest refusal_score, then lowest kl_div_score, then highest steering_score
+        fallback = sorted(
+            all_scores,
+            key=lambda x: (x['refusal_score'], x['kl_div_score'], -x['steering_score']),
+        )
+        filtered_scores.append(fallback[0])
+        print(
+            f"  Fallback selected: pos={fallback[0]['position']}, layer={fallback[0]['layer']}, "
+            f"refusal={fallback[0]['refusal_score']:.4f}, kl={fallback[0]['kl_div_score']:.4f}, "
+            f"steering={fallback[0]['steering_score']:.4f}"
         )
 
-    all_scores.sort(key=lambda x: x['steering_score'], reverse=True)
+    filtered_scores.sort(key=lambda x: (-x['sorting_score'], x['position'], x['layer']))
+
+    def _json_row(x):
+        return {
+            'position': x['position'],
+            'layer': x['layer'],
+            'refusal_score': x['refusal_score'],
+            'steering_score': x['steering_score'],
+            'kl_div_score': x['kl_div_score'],
+            'n_classifiers': x['n_classifiers'],
+            'sorting_score': x['sorting_score'],
+        }
+
     with open(os.path.join(artifact_dir, "inlp_selection_scores.json"), "w") as f:
-        _json.dump(all_scores, f, indent=4)
+        _json.dump([_json_row(x) for x in all_scores], f, indent=4)
+    with open(os.path.join(artifact_dir, "inlp_selection_scores_filtered.json"), "w") as f:
+        _json.dump([_json_row(x) for x in filtered_scores], f, indent=4)
+
+    best = filtered_scores[0]
 
     print(
-        f"INLP selection: best pos={best_pos}, layer={best_layer}, "
-        f"steering_score={best_steering_score:.4f} "
-        f"(baseline_refusal={baseline_refusal:.4f}, "
-        f"projected_refusal={baseline_refusal - best_steering_score:.4f})"
+        f"INLP selection: best pos={best['position']}, layer={best['layer']}, "
+        f"refusal_score={best['refusal_score']:.4f} "
+        f"(harmful baseline={baseline_refusal_harmful:.4f}, "
+        f"harmless steering baseline={baseline_refusal_harmless:.4f}, "
+        f"harmless steering={best['steering_score']:.4f}, "
+        f"kl={best['kl_div_score']:.4f})"
+    )
+    print(f"INLP pool sizes: all={len(all_scores)}, filtered={len(filtered_scores)}")
+
+    return all_scores, filtered_scores
+
+
+def select_direction_inlp(
+    artifact_dir: str,
+    model_base: ModelBase,
+    harmful_instructions: List[str],
+    harmless_instructions: List[str],
+    actadd_multipliers: list,
+    direction_norm: float,
+    kl_threshold: Optional[float] = 0.1,
+    prune_layer_percentage: float = 0.20,
+    batch_size: int = 32,
+) -> Tuple[int, int, np.ndarray, np.ndarray]:
+    """Backward-compatible wrapper that returns only the best component."""
+    ranked = select_direction_inlp_ranked(
+        artifact_dir=artifact_dir,
+        model_base=model_base,
+        harmful_instructions=harmful_instructions,
+        harmless_instructions=harmless_instructions,
+        actadd_multipliers=actadd_multipliers,
+        direction_norm=direction_norm,
+        kl_threshold=kl_threshold,
+        prune_layer_percentage=prune_layer_percentage,
+        batch_size=batch_size,
     )
 
-    return best_pos, best_layer, best_first_dir, best_P
+    best = ranked[0]
+    return best['position'], best['layer'], best['first_dir'], best['P']
