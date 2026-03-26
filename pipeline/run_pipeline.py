@@ -4,6 +4,7 @@ import random
 import json
 import os
 import argparse
+import math
 
 from dataset.load_dataset import load_dataset_split, load_dataset
 
@@ -11,16 +12,17 @@ from pipeline.config import Config
 from pipeline.model_utils.model_factory import construct_model_base
 from pipeline.utils.hook_utils import (
     get_activation_addition_input_pre_hook,
-    get_all_direction_ablation_hooks,
+    get_direction_ablation_input_pre_hook,
+    get_direction_ablation_output_hook,
     get_nullspace_projection_input_pre_hook,
 )
 
 from pipeline.submodules.generate_directions import generate_directions
 from pipeline.submodules.generate_directions_inlp import (
     generate_directions_inlp,
-    select_direction_inlp,
+    select_direction_inlp_ranked,
 )
-from pipeline.submodules.select_direction import select_direction, get_refusal_scores
+from pipeline.submodules.select_direction import select_direction_ranked, get_refusal_scores
 from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
 from pipeline.submodules.evaluate_loss import evaluate_loss
 
@@ -46,6 +48,19 @@ def parse_arguments():
                              'from a previous run (direction.pt, direction_inlp.pt, etc). '
                              'Re-runs the full intervention sweep (steps 3-5) with normalized '
                              'directions and coefficient sweep, then evaluation.')
+    parser.add_argument('--top_percentage', type=float, default=1.0,
+                        help='Top percentage of filtered ranked components to keep for both mean-diff '
+                            'ablation and INLP nullspace projection. Final selected count is shared '
+                            'across methods as min(target_ablation, target_inlp). (default: 1.0)')
+    parser.add_argument('--extract_only', action='store_true',
+                        help='Run only extraction artifacts (sampling/filtering + mean-diff + INLP activations).')
+    parser.add_argument('--select_only', action='store_true',
+                        help='Run only component selection from previously extracted artifacts.')
+    parser.add_argument('--infer_only', action='store_true',
+                        help='Run only inference/loss from previously selected artifacts.')
+    parser.add_argument('--compare_rankings', action='store_true',
+                        help='Run expensive all-layer (global) scoring and Spearman rank '
+                             'comparison against local (per-component) ranking.')
     return parser.parse_args()
 
 def load_and_sample_datasets(cfg):
@@ -61,6 +76,42 @@ def load_and_sample_datasets(cfg):
     harmful_val = random.sample(load_dataset_split(harmtype='harmful', split='val', instructions_only=True), cfg.n_val)
     harmless_val = random.sample(load_dataset_split(harmtype='harmless', split='val', instructions_only=True), cfg.n_val)
     return harmful_train, harmless_train, harmful_val, harmless_val
+
+
+def save_dataset_artifacts(cfg, harmful_train, harmless_train, harmful_val, harmless_val):
+    """Persist sampled/filtered datasets so selection can run independently later."""
+    payload = {
+        "seed": 42,
+        "harmful_train": harmful_train,
+        "harmless_train": harmless_train,
+        "harmful_val": harmful_val,
+        "harmless_val": harmless_val,
+        "counts": {
+            "harmful_train": len(harmful_train),
+            "harmless_train": len(harmless_train),
+            "harmful_val": len(harmful_val),
+            "harmless_val": len(harmless_val),
+        },
+    }
+    with open(os.path.join(cfg.artifact_path(), 'dataset_artifacts.json'), 'w') as f:
+        json.dump(payload, f, indent=2)
+
+
+def load_dataset_artifacts(cfg):
+    path = os.path.join(cfg.artifact_path(), 'dataset_artifacts.json')
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Missing dataset artifacts at {path}. Run extraction first (or a full pipeline run)."
+        )
+    with open(path, 'r') as f:
+        payload = json.load(f)
+
+    return (
+        payload["harmful_train"],
+        payload["harmless_train"],
+        payload["harmful_val"],
+        payload["harmless_val"],
+    )
 
 def filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val):
     """
@@ -94,15 +145,14 @@ def generate_and_save_candidate_directions(cfg, model_base, harmful_train, harml
     mean_diffs = generate_directions(
         model_base,
         harmful_train,
-        harmless_train,
-        artifact_dir=os.path.join(cfg.artifact_path(), "generate_directions"))
+        harmless_train,)
 
     torch.save(mean_diffs, os.path.join(cfg.artifact_path(), 'generate_directions/mean_diffs.pt'))
 
     return mean_diffs
 
 def generate_and_save_inlp_directions(cfg, model_base, harmful_train, harmless_train):
-    """Cache activations to disk for later INLP direction finding."""
+    """Compute and save INLP parameters (P, first_dir, accuracies) for all (pos, layer) pairs."""
     artifact_dir = os.path.join(cfg.artifact_path(), 'generate_directions_inlp')
     generate_directions_inlp(
         model_base,
@@ -111,63 +161,208 @@ def generate_and_save_inlp_directions(cfg, model_base, harmful_train, harmless_t
         artifact_dir=artifact_dir,
     )
 
-def select_and_save_direction(cfg, model_base, harmful_val, harmless_val, candidate_directions, label=''):
-    """Select and save the best direction using the standard selection criteria.
+def _resolve_target_count(pool_size, top_percentage):
+    if pool_size <= 0:
+        return 0
+    pct = max(0.0, min(100.0, float(top_percentage)))
+    return int(math.ceil(pool_size * (pct / 100.0)))
 
-    Parameters
-    ----------
-    label : str
-        Optional suffix for artifact filenames (e.g. 'inlp') to keep results
-        from different direction-extraction methods separate.
-    """
-    suffix = f'_{label}' if label else ''
-    artifact_dir = os.path.join(cfg.artifact_path(), f'select_direction{suffix}')
+
+def _resolve_shared_component_count(top_percentage, ablation_pool_size, inlp_pool_size):
+    target_ablation = _resolve_target_count(ablation_pool_size, top_percentage)
+    target_inlp = _resolve_target_count(inlp_pool_size, top_percentage)
+
+    # When one method has no components (e.g. INLP found no directions),
+    # don't let it constrain the other method's count.
+    if target_inlp == 0 and target_ablation > 0:
+        return target_ablation, target_ablation, 0
+    if target_ablation == 0 and target_inlp > 0:
+        return target_inlp, 0, target_inlp
+
+    return min(target_ablation, target_inlp), target_ablation, target_inlp
+
+
+def _build_ablation_hooks_from_components(model_base, components, best_direction):
+    """Build ablation hooks applying ``best_direction`` at each component's layer."""
+    pre_hooks = []
+    hooks = []
+    for comp in components:
+        layer = int(comp['layer'])
+        pre_hooks.append((
+            model_base.model_block_modules[layer],
+            get_direction_ablation_input_pre_hook(direction=best_direction),
+        ))
+        hooks.append((
+            model_base.model_attn_modules[layer],
+            get_direction_ablation_output_hook(direction=best_direction),
+        ))
+        hooks.append((
+            model_base.model_mlp_modules[layer],
+            get_direction_ablation_output_hook(direction=best_direction),
+        ))
+    return pre_hooks, hooks
+
+
+def _build_nullspace_hooks_from_components(model_base, components):
+    pre_hooks = []
+    for comp in components:
+        layer = int(comp['layer'])
+        pre_hooks.append((
+            model_base.model_block_modules[layer],
+            get_nullspace_projection_input_pre_hook(comp['P']),
+        ))
+    return pre_hooks, []
+
+
+def _make_ablation_component(row, candidate_directions):
+    """Convert a scored row into a component dict with its direction tensor."""
+    pos = int(row['position'])
+    layer = int(row['layer'])
+    comp = {
+        'position': pos,
+        'layer': layer,
+        'refusal_score_local': float(row['refusal_score_local']),
+        'steering_median_score_local': float(row['steering_median_score_local']),
+        'kl_div_score_local': float(row['kl_div_score_local']),
+        'sorting_score_local': float(row['sorting_score_local']),
+        'direction': candidate_directions[pos, layer].detach().cpu().float(),
+    }
+    # Global scores may be NaN when compare_rankings is False
+    for key in ('refusal_score', 'steering_median_score', 'kl_div_score', 'sorting_score'):
+        comp[key] = float(row.get(key, float('nan')))
+    return comp
+
+
+def select_ranked_direction_components(cfg, model_base, harmful_val, harmless_val, candidate_directions, actadd_multipliers):
+    artifact_dir = os.path.join(cfg.artifact_path(), 'select_direction')
     os.makedirs(artifact_dir, exist_ok=True)
 
-    pos, layer, direction = select_direction(
-        model_base,
-        harmful_val,
-        harmless_val,
-        candidate_directions,
+    all_ranked, filtered_ranked, top_direction_norm = select_direction_ranked(
+        model_base=model_base,
+        harmful_instructions=harmful_val,
+        harmless_instructions=harmless_val,
+        candidate_directions=candidate_directions,
         artifact_dir=artifact_dir,
+        actadd_multipliers=actadd_multipliers,
+        compare_rankings=cfg.compare_rankings,
     )
 
-    with open(f'{cfg.artifact_path()}/direction_metadata{suffix}.json', "w") as f:
-        json.dump({"pos": pos, "layer": layer}, f, indent=4)
+    all_components = [_make_ablation_component(row, candidate_directions) for row in all_ranked]
+    filtered_components = [_make_ablation_component(row, candidate_directions) for row in filtered_ranked]
 
-    torch.save(direction, f'{cfg.artifact_path()}/direction{suffix}.pt')
+    return all_components, filtered_components, top_direction_norm
 
-    return pos, layer, direction
 
-def select_and_save_direction_inlp(cfg, model_base, harmful_val, harmless_val, n_classifiers=20):
-    """Select INLP direction and nullspace projection using nullspace-projection scoring.
+def _make_inlp_component(row):
+    """Convert an INLP scored row into a component dict."""
+    return {
+        'position': int(row['position']),
+        'layer': int(row['layer']),
+        'refusal_score': float(row['refusal_score']),
+        'steering_score': float(row['steering_score']),
+        'kl_div_score': float(row['kl_div_score']),
+        'sorting_score': float(row['sorting_score']),
+        'direction': torch.from_numpy(row['first_dir']).float(),
+        'P': row['P'],
+    }
 
-    Runs full INLP for every (pos, layer) pair, scores each by how much its
-    nullspace projection P reduces refusal on harmful_val, and picks the best.
-    The first INLP classifier direction from that run is saved as the INLP
-    direction for downstream activation-addition analysis.
-    """
-    import numpy as np
+
+def select_ranked_inlp_components(cfg, model_base, harmful_val, harmless_val, actadd_multipliers, direction_norm):
     artifact_dir = os.path.join(cfg.artifact_path(), 'generate_directions_inlp')
 
-    pos, layer, first_dir, P = select_direction_inlp(
+    all_ranked, filtered_ranked = select_direction_inlp_ranked(
         artifact_dir=artifact_dir,
         model_base=model_base,
         harmful_instructions=harmful_val,
         harmless_instructions=harmless_val,
-        n_classifiers=n_classifiers,
-        min_accuracy=0.55,
+        actadd_multipliers=actadd_multipliers,
+        direction_norm=direction_norm,
     )
 
-    direction = torch.from_numpy(first_dir).float()
+    all_components = [_make_inlp_component(row) for row in all_ranked]
+    filtered_components = [_make_inlp_component(row) for row in filtered_ranked]
 
-    with open(f'{cfg.artifact_path()}/direction_metadata_inlp.json', "w") as f:
-        json.dump({"pos": pos, "layer": layer}, f, indent=4)
+    return all_components, filtered_components
 
-    torch.save(direction, f'{cfg.artifact_path()}/direction_inlp.pt')
-    np.save(os.path.join(cfg.artifact_path(), 'nullspace_projection.npy'), P)
 
-    return pos, layer, direction, P
+def _safe_float(val, default=None):
+    """Return val as float, replacing NaN with default for JSON safety."""
+    v = float(val)
+    return default if math.isnan(v) else v
+
+
+def save_selected_component_artifacts(cfg, selected_ablation, selected_inlp,
+                                      ranked_ablation, ranked_inlp,
+                                      filtered_ablation, filtered_inlp,
+                                      ablation_pool_size, inlp_pool_size,
+                                      shared_count, target_ablation, target_inlp):
+    import numpy as np
+
+    artifact_path = cfg.artifact_path()
+
+    # Persist complete ranked pools (unfiltered) for later reselection.
+    torch.save(ranked_ablation, os.path.join(artifact_path, 'ablation_components_ranked.pt'))
+    torch.save(ranked_inlp, os.path.join(artifact_path, 'inlp_components_ranked.pt'))
+
+    # Persist filtered pools for best-direction recovery.
+    torch.save(filtered_ablation, os.path.join(artifact_path, 'ablation_components_filtered.pt'))
+    torch.save(filtered_inlp, os.path.join(artifact_path, 'inlp_components_filtered.pt'))
+
+    # Persist selected component lists (top-k from unfiltered) for reconstruction.
+    torch.save(selected_ablation, os.path.join(artifact_path, 'ablation_components.pt'))
+    torch.save(selected_inlp, os.path.join(artifact_path, 'inlp_components.pt'))
+
+    with open(os.path.join(artifact_path, 'selected_components_metadata.json'), 'w') as f:
+        json.dump({
+            'top_percentage': cfg.top_percentage,
+            'ablation_pool_size': ablation_pool_size,
+            'inlp_pool_size': inlp_pool_size,
+            'target_ablation': target_ablation,
+            'target_inlp': target_inlp,
+            'shared_count': shared_count,
+            'best_ablation': {
+                'position': filtered_ablation[0]['position'],
+                'layer': filtered_ablation[0]['layer'],
+            },
+            'best_inlp': {
+                'position': filtered_inlp[0]['position'],
+                'layer': filtered_inlp[0]['layer'],
+            } if filtered_inlp else None,
+            'selected_ablation': [
+                {
+                    'position': c['position'],
+                    'layer': c['layer'],
+                    'refusal_score_local': _safe_float(c.get('refusal_score_local', float('nan'))),
+                    'steering_median_score_local': _safe_float(c.get('steering_median_score_local', float('nan'))),
+                    'kl_div_score_local': _safe_float(c.get('kl_div_score_local', float('nan'))),
+                }
+                for c in selected_ablation
+            ],
+            'selected_inlp': [
+                {
+                    'position': c['position'],
+                    'layer': c['layer'],
+                    'refusal_score': _safe_float(c.get('refusal_score', float('nan'))),
+                    'steering_score': _safe_float(c.get('steering_score', float('nan'))),
+                    'kl_div_score': _safe_float(c.get('kl_div_score', float('nan'))),
+                }
+                for c in selected_inlp
+            ],
+        }, f, indent=4)
+
+    # Backward-compatible single-component files use the best from filtered pool.
+    best_ablation = filtered_ablation[0]
+
+    with open(os.path.join(artifact_path, 'direction_metadata.json'), 'w') as f:
+        json.dump({'pos': best_ablation['position'], 'layer': best_ablation['layer']}, f, indent=4)
+    torch.save(best_ablation['direction'], os.path.join(artifact_path, 'direction.pt'))
+
+    if filtered_inlp:
+        best_inlp = filtered_inlp[0]
+        with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'w') as f:
+            json.dump({'pos': best_inlp['position'], 'layer': best_inlp['layer']}, f, indent=4)
+        torch.save(best_inlp['direction'], os.path.join(artifact_path, 'direction_inlp.pt'))
+        np.save(os.path.join(artifact_path, 'nullspace_projection.npy'), best_inlp['P'])
 
 
 def generate_and_save_completions_for_dataset(cfg, model_base, fwd_pre_hooks, fwd_hooks, intervention_label, dataset_name, dataset=None):
@@ -218,32 +413,81 @@ def _run_inference(cfg, model_path):
     # Filter datasets based on refusal scores
     harmful_train, harmless_train, harmful_val, harmless_val = filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val)
 
+    # Persist filtered sampled datasets so selection-only can reuse exactly this split.
+    save_dataset_artifacts(cfg, harmful_train, harmless_train, harmful_val, harmless_val)
+
     # 1. Generate candidate refusal directions
     candidate_directions = generate_and_save_candidate_directions(cfg, model_base, harmful_train, harmless_train)
 
     # 1b. Generate candidate directions via INLP (discriminatively trained)
     generate_and_save_inlp_directions(cfg, model_base, harmful_train, harmless_train)
 
-    # 2. Select the most effective mean-difference direction
-    pos, layer, direction = select_and_save_direction(cfg, model_base, harmful_val, harmless_val, candidate_directions)
+    # 2. Rank candidate components for mean-diff and INLP with shared criteria.
+    actadd_multipliers = [0.1, 0.5, 1.0, 2.0, 5.0]
 
-    # 2b+c. Select INLP direction using nullspace-projection scoring.
-    #       For each (pos, layer), runs full INLP -> P, applies P to harmful_val,
-    #       and picks the (pos, layer) where P most reduces refusal (highest
-    #       steering score).  The first INLP classifier direction from that run
-    #       is used as the direction for downstream activation-addition analysis.
-    inlp_pos, inlp_layer, inlp_direction, P = select_and_save_direction_inlp(
-        cfg, model_base, harmful_val, harmless_val, n_classifiers=20
+    all_ablation, filtered_ablation, top_direction_norm = select_ranked_direction_components(
+        cfg, model_base, harmful_val, harmless_val, candidate_directions, actadd_multipliers
+    )
+    all_inlp, filtered_inlp = select_ranked_inlp_components(
+        cfg, model_base, harmful_val, harmless_val, actadd_multipliers, top_direction_norm
     )
 
+    # Top-k layers from unfiltered pool
+    shared_count, target_ablation, target_inlp = _resolve_shared_component_count(
+        top_percentage=cfg.top_percentage,
+        ablation_pool_size=len(all_ablation),
+        inlp_pool_size=len(all_inlp),
+    )
+
+    selected_ablation_layers = all_ablation[:shared_count]
+    selected_inlp_layers = all_inlp[:shared_count]
+
+    save_selected_component_artifacts(
+        cfg,
+        selected_ablation=selected_ablation_layers,
+        selected_inlp=selected_inlp_layers,
+        ranked_ablation=all_ablation,
+        ranked_inlp=all_inlp,
+        filtered_ablation=filtered_ablation,
+        filtered_inlp=filtered_inlp,
+        ablation_pool_size=len(all_ablation),
+        inlp_pool_size=len(all_inlp),
+        shared_count=shared_count,
+        target_ablation=target_ablation,
+        target_inlp=target_inlp,
+    )
+
+    print(
+        f"Selected shared component count={shared_count} "
+        f"(ablation target={target_ablation}/{len(all_ablation)}, "
+        f"inlp target={target_inlp}/{len(all_inlp)}, "
+        f"top_percentage={cfg.top_percentage:.3f}%)"
+    )
+
+    if shared_count == 0:
+        print("shared_count=0 — skipping all interventions, only baseline will be generated.")
+        # Still generate baseline completions below, but skip interventions.
+
+    # Best direction/layer from filtered pool (for ablation direction + actadd)
+    best_direction = filtered_ablation[0]['direction']
+    best_layer = filtered_ablation[0]['layer']
+
+    has_inlp = len(filtered_inlp) > 0
+    if has_inlp:
+        best_inlp_direction = filtered_inlp[0]['direction']
+        best_inlp_layer = filtered_inlp[0]['layer']
+    else:
+        best_inlp_direction = None
+        best_inlp_layer = None
+        print("No INLP directions available — INLP interventions will be skipped.")
+
     # -- Normalize directions for fair comparison ---------------------------------
-    # The diff-in-means direction has arbitrary magnitude; INLP is already ~unit.
-    # We normalize both to unit length and sweep coefficients scaled by the
-    # original diff-in-means norm so that coeff = 1.0 × norm reproduces the
-    # original (un-normalized) actadd behaviour.
-    direction_norm = torch.norm(direction).item()
-    direction_unit = direction / (torch.norm(direction) + 1e-8)
-    inlp_direction_unit = inlp_direction / (torch.norm(inlp_direction) + 1e-8)
+    direction_norm = torch.norm(best_direction).item()
+    direction_unit = best_direction / (torch.norm(best_direction) + 1e-8)
+    if has_inlp:
+        inlp_direction_unit = best_inlp_direction / (torch.norm(best_inlp_direction) + 1e-8)
+    else:
+        inlp_direction_unit = None
 
     actadd_multipliers = [0.1, 0.5, 1.0, 2.0, 5.0]
     actadd_coeffs = [m * direction_norm for m in actadd_multipliers]
@@ -258,40 +502,39 @@ def _run_inference(cfg, model_path):
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
 
-    # Mean-difference direction: ablation across all layers (self-normalizes, uses raw direction)
-    ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
-
-    # INLP nullspace projection: applied only at the layer from which P was extracted
-    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = [
-        (model_base.model_block_modules[inlp_layer],
-         get_nullspace_projection_input_pre_hook(P))
-    ], []
+    # Ablation: best direction (filtered rank-1) at top-k layers (unfiltered)
+    # Nullspace: per-component P at top-k layers (unfiltered)
+    if shared_count > 0:
+        ablation_fwd_pre_hooks, ablation_fwd_hooks = _build_ablation_hooks_from_components(
+            model_base, selected_ablation_layers, best_direction)
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = _build_nullspace_hooks_from_components(
+            model_base, selected_inlp_layers)
+    else:
+        ablation_fwd_pre_hooks, ablation_fwd_hooks = [], []
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = [], []
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
         generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', dataset_name)
-        generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
 
-        # Nullspace projection intervention (applied at the INLP source layer only)
-        generate_and_save_completions_for_dataset(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace', dataset_name)
+        if shared_count > 0:
+            generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
+            generate_and_save_completions_for_dataset(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace', dataset_name)
 
-        # Sweep coefficients for both mean-diff and INLP actadd (unit-normalized directions)
+        # Sweep coefficients for mean-diff actadd (and INLP actadd when available)
         for coeff in actadd_coeffs:
             label = f'actadd_c{coeff:.2f}'
-            hooks_pre = [(model_base.model_block_modules[layer],
+            hooks_pre = [(model_base.model_block_modules[best_layer],
                           get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
             generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, dataset_name)
 
-            inlp_label = f'inlp_actadd_c{coeff:.2f}'
-            inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
-                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
-            generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
+            if has_inlp:
+                inlp_label = f'inlp_actadd_c{coeff:.2f}'
+                inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
+                                   get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+                generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
 
     # 4a. Generate and save completions on harmless evaluation dataset
-    #     (We test whether each intervention INDUCES refusal on harmless prompts,
-    #      which would indicate the intervention is not perfectly specific to harmful
-    #      instructions.  Ablation-style hooks are omitted here because removing the
-    #      refusal direction on already-harmless prompts is not a refusal-induction test.)
     harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
 
     generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
@@ -299,41 +542,127 @@ def _run_inference(cfg, model_path):
     # Sweep coefficients: add refusal direction (+coeff) to harmless prompts
     for coeff in actadd_coeffs:
         label = f'actadd_c{coeff:.2f}'
-        hooks_pre = [(model_base.model_block_modules[layer],
+        hooks_pre = [(model_base.model_block_modules[best_layer],
                       get_activation_addition_input_pre_hook(vector=direction_unit, coeff=+coeff))]
         generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, 'harmless', dataset=harmless_test)
 
-        inlp_label = f'inlp_actadd_c{coeff:.2f}'
-        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
-                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
-        generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
+        if has_inlp:
+            inlp_label = f'inlp_actadd_c{coeff:.2f}'
+            inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
+                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
+            generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
 
     # 5. Evaluate loss on harmless datasets for all interventions
-    #    (checks whether interventions degrade performance on benign prompts)
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
-    evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
-    evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
+    if shared_count > 0:
+        evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
+        evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
 
-    # Sweep coefficients for loss evaluation
     for coeff in actadd_coeffs:
         label = f'actadd_c{coeff:.2f}'
-        hooks_pre = [(model_base.model_block_modules[layer],
+        hooks_pre = [(model_base.model_block_modules[best_layer],
                       get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, hooks_pre, [], label)
 
-        inlp_label = f'inlp_actadd_c{coeff:.2f}'
-        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
-                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
-        evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
+        if has_inlp:
+            inlp_label = f'inlp_actadd_c{coeff:.2f}'
+            inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
+                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+            evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
 
     # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
     model_base.del_model()
     del model_base
-    del candidate_directions, direction, direction_unit, inlp_direction, inlp_direction_unit, P
+    del candidate_directions, best_direction, direction_unit
+    if has_inlp:
+        del best_inlp_direction, inlp_direction_unit
+    del all_ablation, all_inlp, filtered_ablation, filtered_inlp
+    del selected_ablation_layers, selected_inlp_layers
     del baseline_fwd_pre_hooks, baseline_fwd_hooks
     del ablation_fwd_pre_hooks, ablation_fwd_hooks
     del nullspace_fwd_pre_hooks, nullspace_fwd_hooks
 
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _run_extraction(cfg, model_path):
+    """Run only extraction artifacts: datasets + candidate mean-diff + INLP activations."""
+    model_base = construct_model_base(cfg.model_path, device=cfg.device)
+
+    harmful_train, harmless_train, harmful_val, harmless_val = load_and_sample_datasets(cfg)
+    harmful_train, harmless_train, harmful_val, harmless_val = filter_data(
+        cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val
+    )
+
+    save_dataset_artifacts(cfg, harmful_train, harmless_train, harmful_val, harmless_val)
+    generate_and_save_candidate_directions(cfg, model_base, harmful_train, harmless_train)
+    generate_and_save_inlp_directions(cfg, model_base, harmful_train, harmless_train)
+
+    model_base.del_model()
+    del model_base
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _run_selection(cfg, model_path):
+    """Run only component selection using pre-extracted artifacts."""
+    model_base = construct_model_base(cfg.model_path, device=cfg.device)
+    _, _, harmful_val, harmless_val = load_dataset_artifacts(cfg)
+
+    mean_diffs_path = os.path.join(cfg.artifact_path(), 'generate_directions', 'mean_diffs.pt')
+    if not os.path.exists(mean_diffs_path):
+        raise FileNotFoundError(
+            f"Missing extracted mean-diff artifacts at {mean_diffs_path}. Run --extract_only first."
+        )
+    candidate_directions = torch.load(mean_diffs_path, map_location='cpu', weights_only=True)
+
+    actadd_multipliers = [0.1, 0.5, 1.0, 2.0, 5.0]
+
+    all_ablation, filtered_ablation, top_direction_norm = select_ranked_direction_components(
+        cfg, model_base, harmful_val, harmless_val, candidate_directions, actadd_multipliers
+    )
+    all_inlp, filtered_inlp = select_ranked_inlp_components(
+        cfg, model_base, harmful_val, harmless_val, actadd_multipliers, top_direction_norm
+    )
+
+    shared_count, target_ablation, target_inlp = _resolve_shared_component_count(
+        top_percentage=cfg.top_percentage,
+        ablation_pool_size=len(all_ablation),
+        inlp_pool_size=len(all_inlp),
+    )
+
+    selected_ablation_layers = all_ablation[:shared_count]
+    selected_inlp_layers = all_inlp[:shared_count]
+
+    save_selected_component_artifacts(
+        cfg,
+        selected_ablation=selected_ablation_layers,
+        selected_inlp=selected_inlp_layers,
+        ranked_ablation=all_ablation,
+        ranked_inlp=all_inlp,
+        filtered_ablation=filtered_ablation,
+        filtered_inlp=filtered_inlp,
+        ablation_pool_size=len(all_ablation),
+        inlp_pool_size=len(all_inlp),
+        shared_count=shared_count,
+        target_ablation=target_ablation,
+        target_inlp=target_inlp,
+    )
+
+    print(
+        f"Selection complete with shared_count={shared_count} "
+        f"(ablation target={target_ablation}/{len(all_ablation)}, "
+        f"inlp target={target_inlp}/{len(all_inlp)}, "
+        f"top_percentage={cfg.top_percentage:.3f}%)"
+    )
+
+    model_base.del_model()
+    del model_base
+    del candidate_directions, all_ablation, all_inlp, filtered_ablation, filtered_inlp
+    del selected_ablation_layers, selected_inlp_layers
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -384,42 +713,187 @@ def _run_evaluation(cfg):
 
 
 def _run_inference_from_existing(cfg, model_path):
-    """Re-run interventions (steps 3-5) using pre-computed directions.
-
-    Loads saved direction.pt, direction_inlp.pt, nullspace_projection.npy, and
-    metadata from a previous run.  Skips direction extraction (steps 1-2) and
-    jumps straight to the coefficient sweep, completions, and loss evaluation.
-    """
+    """Re-run interventions (steps 3-5) using pre-computed artifacts."""
     import numpy as np
 
     artifact_path = cfg.artifact_path()
 
-    # --- Load pre-computed directions and metadata ---
-    direction = torch.load(os.path.join(artifact_path, 'direction.pt'),
-                           map_location='cpu', weights_only=True)
-    with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
-        meta = json.load(f)
-    pos, layer = meta["pos"], meta["layer"]
+    selected_meta_path = os.path.join(artifact_path, 'selected_components_metadata.json')
+    ranked_ablation_path = os.path.join(artifact_path, 'ablation_components_ranked.pt')
+    ranked_inlp_path = os.path.join(artifact_path, 'inlp_components_ranked.pt')
+    filtered_ablation_path = os.path.join(artifact_path, 'ablation_components_filtered.pt')
+    filtered_inlp_path = os.path.join(artifact_path, 'inlp_components_filtered.pt')
+    ablation_components_path = os.path.join(artifact_path, 'ablation_components.pt')
+    inlp_components_path = os.path.join(artifact_path, 'inlp_components.pt')
 
-    inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'),
-                                map_location='cpu', weights_only=True)
-    with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
-        inlp_meta = json.load(f)
-    inlp_pos, inlp_layer = inlp_meta["pos"], inlp_meta["layer"]
+    selected_ablation_layers = None
+    selected_inlp_layers = None
+    best_direction = None
+    best_layer = None
+    best_inlp_direction = None
+    best_inlp_layer = None
+    shared_count = 0
 
-    P = np.load(os.path.join(artifact_path, 'nullspace_projection.npy'))
+    if os.path.exists(selected_meta_path) and os.path.exists(ranked_ablation_path) and os.path.exists(ranked_inlp_path):
+        with open(selected_meta_path, 'r') as f:
+            selected_meta = json.load(f)
 
-    print(f"Loaded directions from {artifact_path}")
-    print(f"  diff-in-means: pos={pos}, layer={layer}, norm={torch.norm(direction).item():.4f}")
-    print(f"  INLP:          pos={inlp_pos}, layer={inlp_layer}, norm={torch.norm(inlp_direction).item():.4f}")
+        ranked_ablation = torch.load(ranked_ablation_path, map_location='cpu', weights_only=False)
+        ranked_inlp = torch.load(ranked_inlp_path, map_location='cpu', weights_only=False)
+
+        shared_count, target_ablation, target_inlp = _resolve_shared_component_count(
+            top_percentage=cfg.top_percentage,
+            ablation_pool_size=int(selected_meta.get('ablation_pool_size', len(ranked_ablation))),
+            inlp_pool_size=int(selected_meta.get('inlp_pool_size', len(ranked_inlp))),
+        )
+
+        if len(ranked_ablation) < shared_count or len(ranked_inlp) < shared_count:
+            raise RuntimeError(
+                "Existing multi-component artifacts are insufficient for requested top_percentage. "
+                "Please rerun extraction/selection without --use_existing."
+            )
+
+        selected_ablation_layers = ranked_ablation[:shared_count]
+        selected_inlp_layers = ranked_inlp[:shared_count]
+
+        # Best direction from filtered pool
+        if os.path.exists(filtered_ablation_path) and os.path.exists(filtered_inlp_path):
+            print("Loaded filtered multi-component artifacts for best direction recovery.")
+            filtered_ablation = torch.load(filtered_ablation_path, map_location='cpu', weights_only=False)
+            filtered_inlp = torch.load(filtered_inlp_path, map_location='cpu', weights_only=False)
+            best_direction = filtered_ablation[0]['direction']
+            best_layer = filtered_ablation[0]['layer']
+            if filtered_inlp:
+                best_inlp_direction = filtered_inlp[0]['direction']
+                best_inlp_layer = filtered_inlp[0]['layer']
+        else:
+            # Fallback: use backward-compatible single-component files
+            print("Using backward-compatible single-component files.")
+            best_direction = torch.load(os.path.join(artifact_path, 'direction.pt'), map_location='cpu', weights_only=True)
+            with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
+                meta = json.load(f)
+            best_layer = int(meta['layer'])
+            best_inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
+            with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
+                inlp_meta = json.load(f)
+            best_inlp_layer = int(inlp_meta['layer'])
+
+        print(
+            f"Loaded ranked multi-component artifacts from {artifact_path} with shared_count={shared_count} "
+            f"(targets: ablation={target_ablation}, inlp={target_inlp})."
+        )
+
+    elif os.path.exists(selected_meta_path) and os.path.exists(ablation_components_path) and os.path.exists(inlp_components_path):
+        with open(selected_meta_path, 'r') as f:
+            selected_meta = json.load(f)
+
+        ablation_components = torch.load(ablation_components_path, map_location='cpu', weights_only=False)
+        inlp_components = torch.load(inlp_components_path, map_location='cpu', weights_only=False)
+
+        shared_count, target_ablation, target_inlp = _resolve_shared_component_count(
+            top_percentage=cfg.top_percentage,
+            ablation_pool_size=int(selected_meta.get('ablation_pool_size', len(ablation_components))),
+            inlp_pool_size=int(selected_meta.get('inlp_pool_size', len(inlp_components))),
+        )
+
+        if len(ablation_components) < shared_count or len(inlp_components) < shared_count:
+            raise RuntimeError(
+                "Existing multi-component artifacts are insufficient for requested top_percentage. "
+                "Please rerun extraction/selection without --use_existing."
+            )
+
+        selected_ablation_layers = ablation_components[:shared_count]
+        selected_inlp_layers = inlp_components[:shared_count]
+
+        # Best direction from filtered pool or fallback to backward-compatible files
+        if os.path.exists(filtered_ablation_path) and os.path.exists(filtered_inlp_path):
+            filtered_ablation = torch.load(filtered_ablation_path, map_location='cpu', weights_only=False)
+            filtered_inlp = torch.load(filtered_inlp_path, map_location='cpu', weights_only=False)
+            best_direction = filtered_ablation[0]['direction']
+            best_layer = filtered_ablation[0]['layer']
+            if filtered_inlp:
+                best_inlp_direction = filtered_inlp[0]['direction']
+                best_inlp_layer = filtered_inlp[0]['layer']
+        else:
+            best_direction = torch.load(os.path.join(artifact_path, 'direction.pt'), map_location='cpu', weights_only=True)
+            with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
+                meta = json.load(f)
+            best_layer = int(meta['layer'])
+            best_inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
+            with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
+                inlp_meta = json.load(f)
+            best_inlp_layer = int(inlp_meta['layer'])
+
+        print(
+            f"Loaded selected multi-component artifacts (no ranked pools) from {artifact_path} "
+            f"with shared_count={shared_count} (targets: ablation={target_ablation}, inlp={target_inlp})."
+        )
+
+    else:
+        # Legacy fallback: single-component artifacts only.
+        best_direction = torch.load(os.path.join(artifact_path, 'direction.pt'), map_location='cpu', weights_only=True)
+        with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
+            meta = json.load(f)
+
+        best_inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
+        with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
+            inlp_meta = json.load(f)
+
+        P = np.load(os.path.join(artifact_path, 'nullspace_projection.npy'))
+
+        # Try to resolve required shared count from ranked pools when available.
+        ranked_ablation_json = os.path.join(artifact_path, 'select_direction', 'direction_evaluations_filtered_local.json')
+        ranked_inlp_json = os.path.join(artifact_path, 'generate_directions_inlp', 'inlp_selection_scores_filtered.json')
+        if os.path.exists(ranked_ablation_json) and os.path.exists(ranked_inlp_json):
+            with open(ranked_ablation_json, 'r') as f:
+                ablation_ranked = json.load(f)
+            with open(ranked_inlp_json, 'r') as f:
+                inlp_ranked = json.load(f)
+
+            resolved_count, _, _ = _resolve_shared_component_count(
+                top_percentage=cfg.top_percentage,
+                ablation_pool_size=len(ablation_ranked),
+                inlp_pool_size=len(inlp_ranked),
+            )
+            if resolved_count > 1:
+                raise RuntimeError(
+                    "Requested top_percentage resolves to multiple components, but only legacy "
+                    "single-component INLP artifacts are available. Rerun extraction/selection "
+                    "without --use_existing to generate multi-component artifacts."
+                )
+
+        best_layer = int(meta['layer'])
+        best_inlp_layer = int(inlp_meta['layer'])
+        shared_count = 1
+
+        selected_ablation_layers = [{
+            'position': int(meta['pos']),
+            'layer': best_layer,
+            'direction': best_direction,
+        }]
+        selected_inlp_layers = [{
+            'position': int(inlp_meta['pos']),
+            'layer': best_inlp_layer,
+            'direction': best_inlp_direction,
+            'P': P,
+        }]
+
+        print(f"Loaded legacy single-component artifacts from {artifact_path}")
+
+    has_inlp = best_inlp_direction is not None
+    if not has_inlp:
+        print("No INLP directions available — INLP interventions will be skipped.")
 
     # --- Load model ---
     model_base = construct_model_base(cfg.model_path, device=cfg.device)
 
     # -- Normalize directions for fair comparison ---------------------------------
-    direction_norm = torch.norm(direction).item()
-    direction_unit = direction / (torch.norm(direction) + 1e-8)
-    inlp_direction_unit = inlp_direction / (torch.norm(inlp_direction) + 1e-8)
+    direction_norm = torch.norm(best_direction).item()
+    direction_unit = best_direction / (torch.norm(best_direction) + 1e-8)
+    if has_inlp:
+        inlp_direction_unit = best_inlp_direction / (torch.norm(best_inlp_direction) + 1e-8)
+    else:
+        inlp_direction_unit = None
 
     actadd_multipliers = [0.1, 0.5, 1.0, 2.0, 5.0]
     actadd_coeffs = [m * direction_norm for m in actadd_multipliers]
@@ -434,34 +908,35 @@ def _run_inference_from_existing(cfg, model_path):
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
 
-    # Mean-difference direction: ablation across all layers (self-normalizes, uses raw direction)
-    ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
-
-    # INLP nullspace projection: applied only at the layer from which P was extracted
-    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = [
-        (model_base.model_block_modules[inlp_layer],
-         get_nullspace_projection_input_pre_hook(P))
-    ], []
+    if shared_count > 0:
+        ablation_fwd_pre_hooks, ablation_fwd_hooks = _build_ablation_hooks_from_components(
+            model_base, selected_ablation_layers, best_direction)
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = _build_nullspace_hooks_from_components(
+            model_base, selected_inlp_layers)
+    else:
+        ablation_fwd_pre_hooks, ablation_fwd_hooks = [], []
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = [], []
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
         generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', dataset_name)
-        generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
 
-        # Nullspace projection intervention (applied at the INLP source layer only)
-        generate_and_save_completions_for_dataset(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace', dataset_name)
+        if shared_count > 0:
+            generate_and_save_completions_for_dataset(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation', dataset_name)
+            generate_and_save_completions_for_dataset(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace', dataset_name)
 
-        # Sweep coefficients for both mean-diff and INLP actadd (unit-normalized directions)
+        # Sweep coefficients for mean-diff actadd (and INLP actadd when available)
         for coeff in actadd_coeffs:
             label = f'actadd_c{coeff:.2f}'
-            hooks_pre = [(model_base.model_block_modules[layer],
+            hooks_pre = [(model_base.model_block_modules[best_layer],
                           get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
             generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, dataset_name)
 
-            inlp_label = f'inlp_actadd_c{coeff:.2f}'
-            inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
-                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
-            generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
+            if has_inlp:
+                inlp_label = f'inlp_actadd_c{coeff:.2f}'
+                inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
+                                   get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+                generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
 
     # 4a. Generate and save completions on harmless evaluation dataset
     harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
@@ -471,35 +946,41 @@ def _run_inference_from_existing(cfg, model_path):
     # Sweep coefficients: add refusal direction (+coeff) to harmless prompts
     for coeff in actadd_coeffs:
         label = f'actadd_c{coeff:.2f}'
-        hooks_pre = [(model_base.model_block_modules[layer],
+        hooks_pre = [(model_base.model_block_modules[best_layer],
                       get_activation_addition_input_pre_hook(vector=direction_unit, coeff=+coeff))]
         generate_and_save_completions_for_dataset(cfg, model_base, hooks_pre, [], label, 'harmless', dataset=harmless_test)
 
-        inlp_label = f'inlp_actadd_c{coeff:.2f}'
-        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
-                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
-        generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
+        if has_inlp:
+            inlp_label = f'inlp_actadd_c{coeff:.2f}'
+            inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
+                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
+            generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
 
     # 5. Evaluate loss on harmless datasets for all interventions
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
-    evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
-    evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
+    if shared_count > 0:
+        evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
+        evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
 
     for coeff in actadd_coeffs:
         label = f'actadd_c{coeff:.2f}'
-        hooks_pre = [(model_base.model_block_modules[layer],
+        hooks_pre = [(model_base.model_block_modules[best_layer],
                       get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, hooks_pre, [], label)
 
-        inlp_label = f'inlp_actadd_c{coeff:.2f}'
-        inlp_hooks_pre = [(model_base.model_block_modules[inlp_layer],
-                           get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
-        evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
+        if has_inlp:
+            inlp_label = f'inlp_actadd_c{coeff:.2f}'
+            inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
+                               get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+            evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
 
     # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
     model_base.del_model()
     del model_base
-    del direction, direction_unit, inlp_direction, inlp_direction_unit, P
+    del best_direction, direction_unit
+    if has_inlp:
+        del best_inlp_direction, inlp_direction_unit
+    del selected_ablation_layers, selected_inlp_layers
     del baseline_fwd_pre_hooks, baseline_fwd_hooks
     del ablation_fwd_pre_hooks, ablation_fwd_hooks
     del nullspace_fwd_pre_hooks, nullspace_fwd_hooks
@@ -510,11 +991,37 @@ def _run_inference_from_existing(cfg, model_path):
 
 
 def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
-                 resume_from_eval=False, skip_eval=False, use_existing=False):
+                 resume_from_eval=False, skip_eval=False, use_existing=False,
+                 top_percentage=1.0, extract_only=False, select_only=False,
+                 infer_only=False, compare_rankings=False):
     """Run the full pipeline."""
     model_alias = os.path.basename(model_path)
     cfg = Config(model_alias=model_alias, model_path=model_path, device=device,
-                 vllm_gpu_memory_utilization=vllm_gpu_memory_utilization)
+                 vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+                 top_percentage=top_percentage,
+                 compare_rankings=compare_rankings)
+
+    phase_flags = [extract_only, select_only, infer_only]
+    if sum(1 for flag in phase_flags if flag) > 1:
+        raise ValueError("Use at most one of --extract_only, --select_only, or --infer_only.")
+
+    if extract_only:
+        if resume_from_eval or use_existing:
+            raise ValueError("--extract_only is incompatible with --resume_from_eval and --use_existing.")
+        _run_extraction(cfg, model_path)
+        return
+
+    if select_only:
+        if resume_from_eval or use_existing:
+            raise ValueError("--select_only is incompatible with --resume_from_eval and --use_existing.")
+        _run_selection(cfg, model_path)
+        return
+
+    if infer_only:
+        _run_inference_from_existing(cfg, model_path)
+        if not skip_eval:
+            _run_evaluation(cfg)
+        return
 
     if use_existing:
         _run_inference_from_existing(cfg, model_path)
@@ -535,4 +1042,9 @@ if __name__ == "__main__":
                  vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                  resume_from_eval=args.resume_from_eval,
                  skip_eval=args.skip_eval,
-                 use_existing=args.use_existing)
+                 use_existing=args.use_existing,
+                 top_percentage=args.top_percentage,
+                 extract_only=args.extract_only,
+                 select_only=args.select_only,
+                 infer_only=args.infer_only,
+                 compare_rankings=args.compare_rankings)
