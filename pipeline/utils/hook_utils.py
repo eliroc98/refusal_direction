@@ -127,6 +127,7 @@ def get_activation_addition_input_pre_hook(vector: Float[Tensor, "d_model"], coe
     return hook_fn
 
 
+
 # ─── Nullspace projection hooks ───────────────────────────────────────────────
 
 def get_nullspace_projection_input_pre_hook(P: Union[np.ndarray, Tensor]):

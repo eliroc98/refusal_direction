@@ -47,15 +47,12 @@ def get_mean_diff(model, tokenizer, harmful_instructions, harmless_instructions,
 
     return mean_diff
 
-def generate_directions(model_base: ModelBase, harmful_instructions, harmless_instructions, artifact_dir):
-    if not os.path.exists(artifact_dir):
-        os.makedirs(artifact_dir)
+def generate_directions(model_base: ModelBase, harmful_instructions, harmless_instructions):
 
     mean_diffs = get_mean_diff(model_base.model, model_base.tokenizer, harmful_instructions, harmless_instructions, model_base.tokenize_instructions_fn, model_base.model_block_modules, positions=list(range(-len(model_base.eoi_toks), 0)))
 
     assert mean_diffs.shape == (len(model_base.eoi_toks), model_base.model.config.num_hidden_layers, model_base.model.config.hidden_size)
     assert not mean_diffs.isnan().any()
 
-    torch.save(mean_diffs, f"{artifact_dir}/mean_diffs.pt")
 
     return mean_diffs
