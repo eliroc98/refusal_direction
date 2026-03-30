@@ -63,6 +63,17 @@ def parse_arguments():
                              'comparison against local (per-component) ranking.')
     return parser.parse_args()
 
+def save_run_params(cfg, extra_flags=None):
+    """Save all run parameters to run_params.json in the artifact directory."""
+    import dataclasses
+    os.makedirs(cfg.artifact_path(), exist_ok=True)
+    params = dataclasses.asdict(cfg)
+    if extra_flags:
+        params.update(extra_flags)
+    with open(os.path.join(cfg.artifact_path(), 'run_params.json'), 'w') as f:
+        json.dump(params, f, indent=2)
+
+
 def load_and_sample_datasets(cfg):
     """
     Load datasets and sample them based on the configuration.
@@ -93,12 +104,12 @@ def save_dataset_artifacts(cfg, harmful_train, harmless_train, harmful_val, harm
             "harmless_val": len(harmless_val),
         },
     }
-    with open(os.path.join(cfg.artifact_path(), 'dataset_artifacts.json'), 'w') as f:
+    with open(os.path.join(cfg.extraction_path(), 'dataset_artifacts.json'), 'w') as f:
         json.dump(payload, f, indent=2)
 
 
 def load_dataset_artifacts(cfg):
-    path = os.path.join(cfg.artifact_path(), 'dataset_artifacts.json')
+    path = os.path.join(cfg.extraction_path(), 'dataset_artifacts.json')
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Missing dataset artifacts at {path}. Run extraction first (or a full pipeline run)."
@@ -139,21 +150,21 @@ def filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, har
 
 def generate_and_save_candidate_directions(cfg, model_base, harmful_train, harmless_train):
     """Generate and save mean-difference candidate directions."""
-    if not os.path.exists(os.path.join(cfg.artifact_path(), 'generate_directions')):
-        os.makedirs(os.path.join(cfg.artifact_path(), 'generate_directions'))
+    if not os.path.exists(os.path.join(cfg.extraction_path(), 'generate_directions')):
+        os.makedirs(os.path.join(cfg.extraction_path(), 'generate_directions'))
 
     mean_diffs = generate_directions(
         model_base,
         harmful_train,
         harmless_train,)
 
-    torch.save(mean_diffs, os.path.join(cfg.artifact_path(), 'generate_directions/mean_diffs.pt'))
+    torch.save(mean_diffs, os.path.join(cfg.extraction_path(), 'generate_directions/mean_diffs.pt'))
 
     return mean_diffs
 
 def generate_and_save_inlp_directions(cfg, model_base, harmful_train, harmless_train):
     """Compute and save INLP parameters (P, first_dir, accuracies) for all (pos, layer) pairs."""
-    artifact_dir = os.path.join(cfg.artifact_path(), 'generate_directions_inlp')
+    artifact_dir = os.path.join(cfg.extraction_path(), 'generate_directions_inlp')
     generate_directions_inlp(
         model_base,
         harmful_train,
@@ -165,7 +176,7 @@ def _resolve_target_count(pool_size, top_percentage):
     if pool_size <= 0:
         return 0
     pct = max(0.0, min(100.0, float(top_percentage)))
-    return int(math.ceil(pool_size * (pct / 100.0)))
+    return max(1, int(math.ceil(pool_size * (pct / 100.0))))
 
 
 def _resolve_shared_component_count(top_percentage, ablation_pool_size, inlp_pool_size):
@@ -268,7 +279,7 @@ def _make_inlp_component(row):
 
 
 def select_ranked_inlp_components(cfg, model_base, harmful_val, harmless_val, actadd_multipliers, direction_norm):
-    artifact_dir = os.path.join(cfg.artifact_path(), 'generate_directions_inlp')
+    artifact_dir = os.path.join(cfg.extraction_path(), 'generate_directions_inlp')
 
     all_ranked, filtered_ranked = select_direction_inlp_ranked(
         artifact_dir=artifact_dir,
@@ -612,7 +623,7 @@ def _run_selection(cfg, model_path):
     model_base = construct_model_base(cfg.model_path, device=cfg.device)
     _, _, harmful_val, harmless_val = load_dataset_artifacts(cfg)
 
-    mean_diffs_path = os.path.join(cfg.artifact_path(), 'generate_directions', 'mean_diffs.pt')
+    mean_diffs_path = os.path.join(cfg.extraction_path(), 'generate_directions', 'mean_diffs.pt')
     if not os.path.exists(mean_diffs_path):
         raise FileNotFoundError(
             f"Missing extracted mean-diff artifacts at {mean_diffs_path}. Run --extract_only first."
@@ -843,7 +854,7 @@ def _run_inference_from_existing(cfg, model_path):
 
         # Try to resolve required shared count from ranked pools when available.
         ranked_ablation_json = os.path.join(artifact_path, 'select_direction', 'direction_evaluations_filtered_local.json')
-        ranked_inlp_json = os.path.join(artifact_path, 'generate_directions_inlp', 'inlp_selection_scores_filtered.json')
+        ranked_inlp_json = os.path.join(cfg.extraction_path(), 'generate_directions_inlp', 'inlp_selection_scores_filtered.json')
         if os.path.exists(ranked_ablation_json) and os.path.exists(ranked_inlp_json):
             with open(ranked_ablation_json, 'r') as f:
                 ablation_ranked = json.load(f)
@@ -1000,6 +1011,16 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
                  vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
                  top_percentage=top_percentage,
                  compare_rankings=compare_rankings)
+
+    save_run_params(cfg, extra_flags={
+        'resume_from_eval': resume_from_eval,
+        'skip_eval': skip_eval,
+        'use_existing': use_existing,
+        'extract_only': extract_only,
+        'select_only': select_only,
+        'infer_only': infer_only,
+        'compare_rankings': compare_rankings,
+    })
 
     phase_flags = [extract_only, select_only, infer_only]
     if sum(1 for flag in phase_flags if flag) > 1:

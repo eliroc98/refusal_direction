@@ -24,5 +24,13 @@ class Config:
     top_percentage: float = 1.0
     compare_rankings: bool = False
 
-    def artifact_path(self) -> str:
+    def extraction_path(self) -> str:
+        """Path for shared extraction artifacts (dataset splits, mean-diff directions, INLP activations).
+        These do not depend on top_percentage and are reused across runs."""
         return os.path.join(os.path.dirname(os.path.realpath(__file__)), "runs", self.model_alias)
+
+    def artifact_path(self) -> str:
+        """Path for per-run artifacts (selected components, completions, loss evals).
+        Scoped by top_percentage so different runs are kept distinct."""
+        top_pct_str = f"top{self.top_percentage:g}"
+        return os.path.join(os.path.dirname(os.path.realpath(__file__)), "runs", self.model_alias, top_pct_str)
