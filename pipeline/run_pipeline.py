@@ -245,7 +245,7 @@ def _make_ablation_component(row, candidate_directions):
 
 
 def select_ranked_direction_components(cfg, model_base, harmful_val, harmless_val, candidate_directions, actadd_multipliers):
-    artifact_dir = os.path.join(cfg.artifact_path(), 'select_direction')
+    artifact_dir = os.path.join(cfg.extraction_path(), 'select_direction')
     os.makedirs(artifact_dir, exist_ok=True)
 
     all_ranked, filtered_ranked, top_direction_norm = select_direction_ranked(
@@ -309,19 +309,17 @@ def save_selected_component_artifacts(cfg, selected_ablation, selected_inlp,
                                       shared_count, target_ablation, target_inlp):
     import numpy as np
 
+    extraction_path = cfg.extraction_path()
     artifact_path = cfg.artifact_path()
+    os.makedirs(artifact_path, exist_ok=True)
 
-    # Persist complete ranked pools (unfiltered) for later reselection.
-    torch.save(ranked_ablation, os.path.join(artifact_path, 'ablation_components_ranked.pt'))
-    torch.save(ranked_inlp, os.path.join(artifact_path, 'inlp_components_ranked.pt'))
+    # Persist complete ranked pools (unfiltered) for later reselection — shared across runs.
+    torch.save(ranked_ablation, os.path.join(extraction_path, 'ablation_components_ranked.pt'))
+    torch.save(ranked_inlp, os.path.join(extraction_path, 'inlp_components_ranked.pt'))
 
-    # Persist filtered pools for best-direction recovery.
-    torch.save(filtered_ablation, os.path.join(artifact_path, 'ablation_components_filtered.pt'))
-    torch.save(filtered_inlp, os.path.join(artifact_path, 'inlp_components_filtered.pt'))
-
-    # Persist selected component lists (top-k from unfiltered) for reconstruction.
-    torch.save(selected_ablation, os.path.join(artifact_path, 'ablation_components.pt'))
-    torch.save(selected_inlp, os.path.join(artifact_path, 'inlp_components.pt'))
+    # Persist filtered pools for best-direction recovery — shared across runs.
+    torch.save(filtered_ablation, os.path.join(extraction_path, 'ablation_components_filtered.pt'))
+    torch.save(filtered_inlp, os.path.join(extraction_path, 'inlp_components_filtered.pt'))
 
     with open(os.path.join(artifact_path, 'selected_components_metadata.json'), 'w') as f:
         json.dump({
@@ -361,19 +359,19 @@ def save_selected_component_artifacts(cfg, selected_ablation, selected_inlp,
             ],
         }, f, indent=4)
 
-    # Backward-compatible single-component files use the best from filtered pool.
+    # Backward-compatible single-component files use the best from filtered pool — shared across runs.
     best_ablation = filtered_ablation[0]
 
-    with open(os.path.join(artifact_path, 'direction_metadata.json'), 'w') as f:
+    with open(os.path.join(extraction_path, 'direction_metadata.json'), 'w') as f:
         json.dump({'pos': best_ablation['position'], 'layer': best_ablation['layer']}, f, indent=4)
-    torch.save(best_ablation['direction'], os.path.join(artifact_path, 'direction.pt'))
+    torch.save(best_ablation['direction'], os.path.join(extraction_path, 'direction.pt'))
 
     if filtered_inlp:
         best_inlp = filtered_inlp[0]
-        with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'w') as f:
+        with open(os.path.join(extraction_path, 'direction_metadata_inlp.json'), 'w') as f:
             json.dump({'pos': best_inlp['position'], 'layer': best_inlp['layer']}, f, indent=4)
-        torch.save(best_inlp['direction'], os.path.join(artifact_path, 'direction_inlp.pt'))
-        np.save(os.path.join(artifact_path, 'nullspace_projection.npy'), best_inlp['P'])
+        torch.save(best_inlp['direction'], os.path.join(extraction_path, 'direction_inlp.pt'))
+        np.save(os.path.join(extraction_path, 'nullspace_projection.npy'), best_inlp['P'])
 
 
 def generate_and_save_completions_for_dataset(cfg, model_base, fwd_pre_hooks, fwd_hooks, intervention_label, dataset_name, dataset=None):
@@ -506,7 +504,7 @@ def _run_inference(cfg, model_path):
     print(f"ActAdd coefficient sweep: {[f'{c:.2f}' for c in actadd_coeffs]}")
 
     # Persist coefficients so _run_evaluation can discover them
-    with open(os.path.join(cfg.artifact_path(), 'actadd_coeffs.json'), 'w') as f:
+    with open(os.path.join(cfg.extraction_path(), 'actadd_coeffs.json'), 'w') as f:
         json.dump({"direction_norm": direction_norm, "multipliers": actadd_multipliers, "coeffs": actadd_coeffs}, f, indent=2)
 
     # -- Build intervention hooks --------------------------------------------------
@@ -694,7 +692,7 @@ def _run_evaluation(cfg):
         lg2_classifier = LlamaGuard2Classifier(gpu_memory_utilization=cfg.vllm_gpu_memory_utilization)
 
     # Load coefficient sweep from inference stage
-    coeffs_path = os.path.join(cfg.artifact_path(), 'actadd_coeffs.json')
+    coeffs_path = os.path.join(cfg.extraction_path(), 'actadd_coeffs.json')
     with open(coeffs_path, 'r') as f:
         actadd_coeffs = json.load(f)["coeffs"]
 
@@ -728,14 +726,13 @@ def _run_inference_from_existing(cfg, model_path):
     import numpy as np
 
     artifact_path = cfg.artifact_path()
+    extraction_path = cfg.extraction_path()
 
     selected_meta_path = os.path.join(artifact_path, 'selected_components_metadata.json')
-    ranked_ablation_path = os.path.join(artifact_path, 'ablation_components_ranked.pt')
-    ranked_inlp_path = os.path.join(artifact_path, 'inlp_components_ranked.pt')
-    filtered_ablation_path = os.path.join(artifact_path, 'ablation_components_filtered.pt')
-    filtered_inlp_path = os.path.join(artifact_path, 'inlp_components_filtered.pt')
-    ablation_components_path = os.path.join(artifact_path, 'ablation_components.pt')
-    inlp_components_path = os.path.join(artifact_path, 'inlp_components.pt')
+    ranked_ablation_path = os.path.join(extraction_path, 'ablation_components_ranked.pt')
+    ranked_inlp_path = os.path.join(extraction_path, 'inlp_components_ranked.pt')
+    filtered_ablation_path = os.path.join(extraction_path, 'ablation_components_filtered.pt')
+    filtered_inlp_path = os.path.join(extraction_path, 'inlp_components_filtered.pt')
 
     selected_ablation_layers = None
     selected_inlp_layers = None
@@ -745,17 +742,14 @@ def _run_inference_from_existing(cfg, model_path):
     best_inlp_layer = None
     shared_count = 0
 
-    if os.path.exists(selected_meta_path) and os.path.exists(ranked_ablation_path) and os.path.exists(ranked_inlp_path):
-        with open(selected_meta_path, 'r') as f:
-            selected_meta = json.load(f)
-
+    if os.path.exists(ranked_ablation_path) and os.path.exists(ranked_inlp_path):
         ranked_ablation = torch.load(ranked_ablation_path, map_location='cpu', weights_only=False)
         ranked_inlp = torch.load(ranked_inlp_path, map_location='cpu', weights_only=False)
 
         shared_count, target_ablation, target_inlp = _resolve_shared_component_count(
             top_percentage=cfg.top_percentage,
-            ablation_pool_size=int(selected_meta.get('ablation_pool_size', len(ranked_ablation))),
-            inlp_pool_size=int(selected_meta.get('inlp_pool_size', len(ranked_inlp))),
+            ablation_pool_size=len(ranked_ablation),
+            inlp_pool_size=len(ranked_inlp),
         )
 
         if len(ranked_ablation) < shared_count or len(ranked_inlp) < shared_count:
@@ -769,7 +763,6 @@ def _run_inference_from_existing(cfg, model_path):
 
         # Best direction from filtered pool
         if os.path.exists(filtered_ablation_path) and os.path.exists(filtered_inlp_path):
-            print("Loaded filtered multi-component artifacts for best direction recovery.")
             filtered_ablation = torch.load(filtered_ablation_path, map_location='cpu', weights_only=False)
             filtered_inlp = torch.load(filtered_inlp_path, map_location='cpu', weights_only=False)
             best_direction = filtered_ablation[0]['direction']
@@ -779,82 +772,35 @@ def _run_inference_from_existing(cfg, model_path):
                 best_inlp_layer = filtered_inlp[0]['layer']
         else:
             # Fallback: use backward-compatible single-component files
-            print("Using backward-compatible single-component files.")
-            best_direction = torch.load(os.path.join(artifact_path, 'direction.pt'), map_location='cpu', weights_only=True)
-            with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
+            best_direction = torch.load(os.path.join(extraction_path, 'direction.pt'), map_location='cpu', weights_only=True)
+            with open(os.path.join(extraction_path, 'direction_metadata.json'), 'r') as f:
                 meta = json.load(f)
             best_layer = int(meta['layer'])
-            best_inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
-            with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
+            best_inlp_direction = torch.load(os.path.join(extraction_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
+            with open(os.path.join(extraction_path, 'direction_metadata_inlp.json'), 'r') as f:
                 inlp_meta = json.load(f)
             best_inlp_layer = int(inlp_meta['layer'])
 
         print(
-            f"Loaded ranked multi-component artifacts from {artifact_path} with shared_count={shared_count} "
+            f"Loaded ranked multi-component artifacts from {extraction_path} with shared_count={shared_count} "
             f"(targets: ablation={target_ablation}, inlp={target_inlp})."
-        )
-
-    elif os.path.exists(selected_meta_path) and os.path.exists(ablation_components_path) and os.path.exists(inlp_components_path):
-        with open(selected_meta_path, 'r') as f:
-            selected_meta = json.load(f)
-
-        ablation_components = torch.load(ablation_components_path, map_location='cpu', weights_only=False)
-        inlp_components = torch.load(inlp_components_path, map_location='cpu', weights_only=False)
-
-        shared_count, target_ablation, target_inlp = _resolve_shared_component_count(
-            top_percentage=cfg.top_percentage,
-            ablation_pool_size=int(selected_meta.get('ablation_pool_size', len(ablation_components))),
-            inlp_pool_size=int(selected_meta.get('inlp_pool_size', len(inlp_components))),
-        )
-
-        if len(ablation_components) < shared_count or len(inlp_components) < shared_count:
-            raise RuntimeError(
-                "Existing multi-component artifacts are insufficient for requested top_percentage. "
-                "Please rerun extraction/selection without --use_existing."
-            )
-
-        selected_ablation_layers = ablation_components[:shared_count]
-        selected_inlp_layers = inlp_components[:shared_count]
-
-        # Best direction from filtered pool or fallback to backward-compatible files
-        if os.path.exists(filtered_ablation_path) and os.path.exists(filtered_inlp_path):
-            filtered_ablation = torch.load(filtered_ablation_path, map_location='cpu', weights_only=False)
-            filtered_inlp = torch.load(filtered_inlp_path, map_location='cpu', weights_only=False)
-            best_direction = filtered_ablation[0]['direction']
-            best_layer = filtered_ablation[0]['layer']
-            if filtered_inlp:
-                best_inlp_direction = filtered_inlp[0]['direction']
-                best_inlp_layer = filtered_inlp[0]['layer']
-        else:
-            best_direction = torch.load(os.path.join(artifact_path, 'direction.pt'), map_location='cpu', weights_only=True)
-            with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
-                meta = json.load(f)
-            best_layer = int(meta['layer'])
-            best_inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
-            with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
-                inlp_meta = json.load(f)
-            best_inlp_layer = int(inlp_meta['layer'])
-
-        print(
-            f"Loaded selected multi-component artifacts (no ranked pools) from {artifact_path} "
-            f"with shared_count={shared_count} (targets: ablation={target_ablation}, inlp={target_inlp})."
         )
 
     else:
         # Legacy fallback: single-component artifacts only.
-        best_direction = torch.load(os.path.join(artifact_path, 'direction.pt'), map_location='cpu', weights_only=True)
-        with open(os.path.join(artifact_path, 'direction_metadata.json'), 'r') as f:
+        best_direction = torch.load(os.path.join(extraction_path, 'direction.pt'), map_location='cpu', weights_only=True)
+        with open(os.path.join(extraction_path, 'direction_metadata.json'), 'r') as f:
             meta = json.load(f)
 
-        best_inlp_direction = torch.load(os.path.join(artifact_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
-        with open(os.path.join(artifact_path, 'direction_metadata_inlp.json'), 'r') as f:
+        best_inlp_direction = torch.load(os.path.join(extraction_path, 'direction_inlp.pt'), map_location='cpu', weights_only=True)
+        with open(os.path.join(extraction_path, 'direction_metadata_inlp.json'), 'r') as f:
             inlp_meta = json.load(f)
 
-        P = np.load(os.path.join(artifact_path, 'nullspace_projection.npy'))
+        P = np.load(os.path.join(extraction_path, 'nullspace_projection.npy'))
 
         # Try to resolve required shared count from ranked pools when available.
-        ranked_ablation_json = os.path.join(artifact_path, 'select_direction', 'direction_evaluations_filtered_local.json')
-        ranked_inlp_json = os.path.join(cfg.extraction_path(), 'generate_directions_inlp', 'inlp_selection_scores_filtered.json')
+        ranked_ablation_json = os.path.join(extraction_path, 'select_direction', 'direction_evaluations_filtered_local.json')
+        ranked_inlp_json = os.path.join(extraction_path, 'generate_directions_inlp', 'inlp_selection_scores_filtered.json')
         if os.path.exists(ranked_ablation_json) and os.path.exists(ranked_inlp_json):
             with open(ranked_ablation_json, 'r') as f:
                 ablation_ranked = json.load(f)
@@ -912,7 +858,7 @@ def _run_inference_from_existing(cfg, model_path):
     print(f"ActAdd coefficient sweep: {[f'{c:.2f}' for c in actadd_coeffs]}")
 
     # Persist coefficients so _run_evaluation can discover them
-    with open(os.path.join(cfg.artifact_path(), 'actadd_coeffs.json'), 'w') as f:
+    with open(os.path.join(cfg.extraction_path(), 'actadd_coeffs.json'), 'w') as f:
         json.dump({"direction_norm": direction_norm, "multipliers": actadd_multipliers, "coeffs": actadd_coeffs}, f, indent=2)
 
     # -- Build intervention hooks --------------------------------------------------
