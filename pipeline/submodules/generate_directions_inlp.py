@@ -270,6 +270,46 @@ def generate_directions_inlp(
     print(f"INLP: saved results for {len(inlp_params)} (pos, layer) pairs to {artifact_dir}/inlp_results.pt")
 
 
+# ─── Extract directions from a P matrix ──────────────────────────────────────
+
+def get_directions_from_P(
+    P: np.ndarray,
+    k: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract INLP directions from projection matrix P via SVD of (I - P).
+
+    Since P = I - V^T @ V where V contains orthogonal INLP directions,
+    we can recover V from SVD(I - P) and optionally keep only the top-k
+    singular vectors to build a k-restricted projection.
+
+    Parameters
+    ----------
+    P : np.ndarray, shape (d, d)
+        Nullspace projection matrix.
+    k : int or None
+        If given, keep only the top-k singular vectors of (I - P).
+        None keeps all directions found in P (full rank of I - P).
+
+    Returns
+    -------
+    directions : np.ndarray, shape (rank_or_k, d)
+        Orthogonal directions recovered from P.
+    P_k : np.ndarray, shape (d, d)
+        Rebuilt projection using only top-k directions:
+        P_k = I - V[:k].T @ V[:k].
+        When k is None, P_k reproduces the original P up to numerical error.
+    """
+    d = P.shape[0]
+    I_minus_P = np.eye(d, dtype=np.float32) - P.astype(np.float32)
+    _, s, Vh = np.linalg.svd(I_minus_P, full_matrices=False)
+    rank = int((s > 1e-6).sum())
+    if k is not None:
+        rank = min(k, rank)
+    directions = Vh[:rank]                               # (rank, d)
+    P_k = np.eye(d, dtype=np.float32) - directions.T @ directions  # (d, d)
+    return directions, P_k
+
+
 # ─── Nullspace projection for selected (pos, layer) ──────────────────────────
 
 def compute_inlp_nullspace_projection(
@@ -493,6 +533,7 @@ def select_direction_inlp_ranked(
                 'steering_score': steering_score,
                 'kl_div_score': kl,
                 'n_classifiers': len(accuracies),
+                'first_classifier_acc': accuracies[0],
                 'sorting_score': -refusal_score,
                 'first_dir': first_dir.squeeze().copy(),
                 'P': P.copy(),
@@ -542,7 +583,7 @@ def select_direction_inlp_ranked(
         artifact_dir=artifact_dir,
         artifact_name='inlp_kl_div_scores',
     )
-    all_scores.sort(key=lambda x: (-x['sorting_score'], x['position'], x['layer']))
+    all_scores.sort(key=lambda x: (-x['sorting_score'], -x['first_classifier_acc'], x['position'], x['layer']))
     if len(filtered_scores) == 0:
         if len(all_scores) == 0:
             print("WARNING: No valid INLP direction found at any (pos, layer). INLP interventions will be skipped.")
@@ -557,7 +598,7 @@ def select_direction_inlp_ranked(
         # Rank by: lowest refusal_score, then lowest kl_div_score, then highest steering_score
         fallback = sorted(
             all_scores,
-            key=lambda x: (x['refusal_score'], x['kl_div_score'], -x['steering_score']),
+            key=lambda x: (x['refusal_score'], x['kl_div_score'], -x['first_classifier_acc'], -x['steering_score']),
         )
         filtered_scores.append(fallback[0])
         print(
@@ -566,7 +607,7 @@ def select_direction_inlp_ranked(
             f"steering={fallback[0]['steering_score']:.4f}"
         )
 
-    filtered_scores.sort(key=lambda x: (-x['sorting_score'], x['position'], x['layer']))
+    filtered_scores.sort(key=lambda x: (-x['sorting_score'], -x['first_classifier_acc'], x['position'], x['layer']))
 
     def _json_row(x):
         return {
@@ -576,6 +617,7 @@ def select_direction_inlp_ranked(
             'steering_score': x['steering_score'],
             'kl_div_score': x['kl_div_score'],
             'n_classifiers': x['n_classifiers'],
+            'first_classifier_acc': x['first_classifier_acc'],
             'sorting_score': x['sorting_score'],
         }
 
