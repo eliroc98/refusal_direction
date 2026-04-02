@@ -277,6 +277,83 @@ def get_all_direction_ablation_hooks_per_layer(
     return fwd_pre_hooks, fwd_hooks
 
 
+# ─── Counterfactual reflection hooks ─────────────────────────────────────────
+
+def get_counterfactual_reflection_input_pre_hook(P: Union[np.ndarray, Tensor], alpha: float = 1.0):
+    """Pre-hook: h_new = h @ P_alpha^T where P_alpha = alpha*P + (1-alpha)*I.
+
+    P_alpha is precomputed once at hook creation time for efficiency.
+    alpha=0 → identity (no-op), alpha=1 → pure nullspace projection,
+    alpha=2 → reflection through the nullspace (2P - I).
+    """
+    P_tensor = torch.as_tensor(P, dtype=torch.float32) if isinstance(P, np.ndarray) else P.float()
+    d = P_tensor.shape[0]
+    P_alpha = alpha * P_tensor + (1.0 - alpha) * torch.eye(d, dtype=torch.float32)
+
+    def hook_fn(module, input):
+        if isinstance(input, tuple):
+            activation: Float[Tensor, "batch_size seq_len d_model"] = input[0]
+        else:
+            activation: Float[Tensor, "batch_size seq_len d_model"] = input
+
+        P_cast = P_alpha.to(dtype=activation.dtype, device=activation.device)
+        activation = torch.matmul(activation, P_cast.T)
+
+        if isinstance(input, tuple):
+            return (activation, *input[1:])
+        else:
+            return activation
+    return hook_fn
+
+
+def get_counterfactual_reflection_output_hook(P: Union[np.ndarray, Tensor], alpha: float = 1.0):
+    """Output hook variant of counterfactual reflection."""
+    P_tensor = torch.as_tensor(P, dtype=torch.float32) if isinstance(P, np.ndarray) else P.float()
+    d = P_tensor.shape[0]
+    P_alpha = alpha * P_tensor + (1.0 - alpha) * torch.eye(d, dtype=torch.float32)
+
+    def hook_fn(module, input, output):
+        if isinstance(output, tuple):
+            activation: Float[Tensor, "batch_size seq_len d_model"] = output[0]
+        else:
+            activation: Float[Tensor, "batch_size seq_len d_model"] = output
+
+        P_cast = P_alpha.to(dtype=activation.dtype, device=activation.device)
+        activation = torch.matmul(activation, P_cast.T)
+
+        if isinstance(output, tuple):
+            return (activation, *output[1:])
+        else:
+            return activation
+    return hook_fn
+
+
+def get_all_counterfactual_reflection_hooks(
+    model_base,
+    P: Union[np.ndarray, Tensor],
+    alpha: float = 1.0,
+):
+    """Apply counterfactual reflection to all layers with one P matrix.
+
+    Same structure as get_all_nullspace_projection_hooks, but applies
+    P_alpha = alpha*P + (1-alpha)*I instead of plain P.
+    """
+    n_layers = model_base.model.config.num_hidden_layers
+    fwd_pre_hooks = [
+        (model_base.model_block_modules[l], get_counterfactual_reflection_input_pre_hook(P, alpha=alpha))
+        for l in range(n_layers)
+    ]
+    fwd_hooks = [
+        (model_base.model_attn_modules[l], get_counterfactual_reflection_output_hook(P, alpha=alpha))
+        for l in range(n_layers)
+    ]
+    fwd_hooks += [
+        (model_base.model_mlp_modules[l], get_counterfactual_reflection_output_hook(P, alpha=alpha))
+        for l in range(n_layers)
+    ]
+    return fwd_pre_hooks, fwd_hooks
+
+
 def get_all_activation_addition_hooks_per_layer(
     model_base,
     candidate_directions: Float[Tensor, "n_pos n_layers d_model"],

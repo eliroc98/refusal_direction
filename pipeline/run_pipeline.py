@@ -18,12 +18,15 @@ from pipeline.utils.hook_utils import (
     get_nullspace_projection_output_hook,
     get_direction_ablation_hooks,
     get_nullspace_projection_hooks,
+    get_all_nullspace_projection_hooks,
+    get_all_counterfactual_reflection_hooks,
 )
 
 from pipeline.submodules.generate_directions import generate_directions
 from pipeline.submodules.generate_directions_inlp import (
     generate_directions_inlp,
     select_direction_inlp_ranked,
+    get_directions_from_P,
 )
 from pipeline.submodules.select_direction import select_direction_ranked, get_refusal_scores
 from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
@@ -402,6 +405,8 @@ def _run_inference(cfg, model_path):
 
     # Top-k layers from unfiltered pool
     n_components = _resolve_target_count(len(all_ablation), cfg.top_percentage)
+    target_ablation = n_components
+    target_inlp = _resolve_target_count(len(all_inlp), cfg.top_percentage)
 
     selected_ablation_layers = all_ablation[:n_components]
     selected_inlp_layers = all_inlp[:n_components]
@@ -452,18 +457,31 @@ def _run_inference(cfg, model_path):
 
     # Persist coefficients so _run_evaluation can discover them
     with open(os.path.join(cfg.extraction_path(), 'actadd_coeffs.json'), 'w') as f:
-        json.dump({"direction_norm": direction_norm, "multipliers": actadd_multipliers, "coeffs": actadd_coeffs}, f, indent=2)
+        json.dump({
+            "direction_norm": direction_norm,
+            "multipliers": actadd_multipliers,
+            "coeffs": actadd_coeffs,
+            "intervention_mode": cfg.intervention_mode,
+            "reflection_alphas": list(cfg.reflection_alphas),
+        }, f, indent=2)
 
     # -- Build intervention hooks --------------------------------------------------
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
 
     # Ablation: best direction (filtered rank-1) at top-k layers (unfiltered)
-    # Nullspace: per-component P at top-k layers (unfiltered)
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_direction_ablation_hooks(
         model_base, selected_ablation_layers, best_direction)
-    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
-        model_base, selected_inlp_layers)
+
+    # Nullspace: single optimal P applied to all layers, or per-component
+    P_raw = filtered_inlp[0]['P']
+    _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
+    if cfg.inlp_single_optimal:
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_all_nullspace_projection_hooks(
+            model_base, P_optimal)
+    else:
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
+            model_base, selected_inlp_layers)
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
@@ -484,6 +502,13 @@ def _run_inference(cfg, model_path):
                                 get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
             generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
 
+        if cfg.intervention_mode in ('reflection', 'both'):
+            for alpha in cfg.reflection_alphas:
+                label = f'reflection_a{alpha:.2f}'
+                refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
+                    model_base, P_optimal, alpha=alpha)
+                generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, dataset_name)
+
     # 4a. Generate and save completions on harmless evaluation dataset
     harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
 
@@ -501,6 +526,13 @@ def _run_inference(cfg, model_path):
                             get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
         generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
 
+    if cfg.intervention_mode in ('reflection', 'both'):
+        for alpha in cfg.reflection_alphas:
+            label = f'reflection_a{alpha:.2f}'
+            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
+                model_base, P_optimal, alpha=alpha)
+            generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, 'harmless', dataset=harmless_test)
+
     # 5. Evaluate loss on harmless datasets for all interventions
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
     evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
@@ -516,6 +548,13 @@ def _run_inference(cfg, model_path):
         inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
                             get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
+
+    if cfg.intervention_mode in ('reflection', 'both'):
+        for alpha in cfg.reflection_alphas:
+            label = f'reflection_a{alpha:.2f}'
+            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
+                model_base, P_optimal, alpha=alpha)
+            evaluate_loss_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
 
     # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
     model_base.del_model()
@@ -576,6 +615,8 @@ def _run_selection(cfg, model_path):
     )
 
     n_components = _resolve_target_count(len(all_ablation), cfg.top_percentage)
+    target_ablation = n_components
+    target_inlp = _resolve_target_count(len(all_inlp), cfg.top_percentage)
 
     selected_ablation_layers = all_ablation[:n_components]
     selected_inlp_layers = all_inlp[:n_components]
@@ -628,7 +669,10 @@ def _run_evaluation(cfg):
     # Load coefficient sweep from inference stage
     coeffs_path = os.path.join(cfg.extraction_path(), 'actadd_coeffs.json')
     with open(coeffs_path, 'r') as f:
-        actadd_coeffs = json.load(f)["coeffs"]
+        saved_params = json.load(f)
+    actadd_coeffs = saved_params["coeffs"]
+    intervention_mode = saved_params.get("intervention_mode", cfg.intervention_mode)
+    reflection_alphas = saved_params.get("reflection_alphas", list(cfg.reflection_alphas))
 
     # 3b. Evaluate completions and save results on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
@@ -643,12 +687,20 @@ def _run_evaluation(cfg):
             evaluate_completions_and_save_results_for_dataset(cfg, f'actadd_c{coeff:.2f}', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
             evaluate_completions_and_save_results_for_dataset(cfg, f'inlp_actadd_c{coeff:.2f}', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
 
+        if intervention_mode in ('reflection', 'both'):
+            for alpha in reflection_alphas:
+                evaluate_completions_and_save_results_for_dataset(cfg, f'reflection_a{alpha:.2f}', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies, llamaguard2_classifier=lg2_classifier)
+
     # 4b. Evaluate completions and save results on harmless evaluation dataset
     evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
 
     for coeff in actadd_coeffs:
         evaluate_completions_and_save_results_for_dataset(cfg, f'actadd_c{coeff:.2f}', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
         evaluate_completions_and_save_results_for_dataset(cfg, f'inlp_actadd_c{coeff:.2f}', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
+
+    if intervention_mode in ('reflection', 'both'):
+        for alpha in reflection_alphas:
+            evaluate_completions_and_save_results_for_dataset(cfg, f'reflection_a{alpha:.2f}', 'harmless', eval_methodologies=cfg.refusal_eval_methodologies)
 
     # Clean up the LlamaGuard2 classifier
     if lg2_classifier is not None:
@@ -720,7 +772,13 @@ def _run_inference_from_existing(cfg, model_path):
 
     # Persist coefficients so _run_evaluation can discover them
     with open(os.path.join(cfg.extraction_path(), 'actadd_coeffs.json'), 'w') as f:
-        json.dump({"direction_norm": direction_norm, "multipliers": actadd_multipliers, "coeffs": actadd_coeffs}, f, indent=2)
+        json.dump({
+            "direction_norm": direction_norm,
+            "multipliers": actadd_multipliers,
+            "coeffs": actadd_coeffs,
+            "intervention_mode": cfg.intervention_mode,
+            "reflection_alphas": list(cfg.reflection_alphas),
+        }, f, indent=2)
 
     # -- Build intervention hooks --------------------------------------------------
 
@@ -728,8 +786,16 @@ def _run_inference_from_existing(cfg, model_path):
 
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_direction_ablation_hooks(
         model_base, selected_ablation_layers, best_direction)
-    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
-        model_base, selected_inlp_layers)
+
+    # Nullspace: single optimal P applied to all layers, or per-component
+    P_raw = filtered_inlp[0]['P']
+    _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
+    if cfg.inlp_single_optimal:
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_all_nullspace_projection_hooks(
+            model_base, P_optimal)
+    else:
+        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
+            model_base, selected_inlp_layers)
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
@@ -751,6 +817,13 @@ def _run_inference_from_existing(cfg, model_path):
                                 get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
             generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, dataset_name)
 
+        if cfg.intervention_mode in ('reflection', 'both'):
+            for alpha in cfg.reflection_alphas:
+                label = f'reflection_a{alpha:.2f}'
+                refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
+                    model_base, P_optimal, alpha=alpha)
+                generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, dataset_name)
+
     # 4a. Generate and save completions on harmless evaluation dataset
     harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
 
@@ -768,6 +841,13 @@ def _run_inference_from_existing(cfg, model_path):
                             get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
         generate_and_save_completions_for_dataset(cfg, model_base, inlp_hooks_pre, [], inlp_label, 'harmless', dataset=harmless_test)
 
+    if cfg.intervention_mode in ('reflection', 'both'):
+        for alpha in cfg.reflection_alphas:
+            label = f'reflection_a{alpha:.2f}'
+            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
+                model_base, P_optimal, alpha=alpha)
+            generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, 'harmless', dataset=harmless_test)
+
     # 5. Evaluate loss on harmless datasets for all interventions
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
     evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
@@ -783,6 +863,13 @@ def _run_inference_from_existing(cfg, model_path):
         inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
                             get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
+
+    if cfg.intervention_mode in ('reflection', 'both'):
+        for alpha in cfg.reflection_alphas:
+            label = f'reflection_a{alpha:.2f}'
+            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
+                model_base, P_optimal, alpha=alpha)
+            evaluate_loss_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
 
     # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
     model_base.del_model()

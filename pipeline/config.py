@@ -1,8 +1,8 @@
 
 import os
 
-from dataclasses import dataclass
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 @dataclass
 class Config:
@@ -23,6 +23,12 @@ class Config:
     ce_loss_n_batches: int = 2048
     top_percentage: float = 1.0
     compare_rankings: bool = False
+    # Single optimal INLP projection
+    inlp_single_optimal: bool = True
+    inlp_k_restrict: Optional[int] = None
+    # Intervention mode
+    intervention_mode: str = 'both'       # 'actadd', 'reflection', or 'both'
+    reflection_alphas: Tuple[float, ...] = (1.0, 1.5, 2.0)
 
     def extraction_path(self) -> str:
         """Path for shared extraction artifacts (dataset splits, mean-diff directions, INLP activations).
