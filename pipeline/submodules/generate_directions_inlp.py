@@ -55,7 +55,7 @@ def _run_inlp(
     X_dev: np.ndarray,
     Y_dev: np.ndarray,
     device: torch.device,
-    n_classifiers: int = 20,
+    n_classifiers: int = 100,
     min_accuracy: float = 0.55,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], List[float]]:
     """Run INLP using PyTorch logistic regression on GPU.
@@ -189,7 +189,7 @@ def generate_directions_inlp(
     harmless_instructions: List[str],
     artifact_dir: str,
     batch_size: int = 32,
-    n_classifiers: int = 20,
+    n_classifiers: int = 100,
     min_accuracy: float = 0.55,
     val_frac: float = 0.2,
 ) -> None:
