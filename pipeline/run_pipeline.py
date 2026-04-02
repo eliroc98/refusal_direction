@@ -16,6 +16,8 @@ from pipeline.utils.hook_utils import (
     get_direction_ablation_output_hook,
     get_nullspace_projection_input_pre_hook,
     get_nullspace_projection_output_hook,
+    get_direction_ablation_hooks,
+    get_nullspace_projection_hooks,
 )
 
 from pipeline.submodules.generate_directions import generate_directions
@@ -180,48 +182,6 @@ def _resolve_target_count(pool_size, top_percentage):
         return 0
     pct = max(0.0, min(100.0, float(top_percentage)))
     return max(1, int(math.ceil(pool_size * (pct / 100.0))))
-
-
-
-def _build_ablation_hooks_from_components(model_base, components, best_direction):
-    """Build ablation hooks applying ``best_direction`` at each component's layer."""
-    pre_hooks = []
-    hooks = []
-    for comp in components:
-        layer = int(comp['layer'])
-        pre_hooks.append((
-            model_base.model_block_modules[layer],
-            get_direction_ablation_input_pre_hook(direction=best_direction),
-        ))
-        hooks.append((
-            model_base.model_attn_modules[layer],
-            get_direction_ablation_output_hook(direction=best_direction),
-        ))
-        hooks.append((
-            model_base.model_mlp_modules[layer],
-            get_direction_ablation_output_hook(direction=best_direction),
-        ))
-    return pre_hooks, hooks
-
-
-def _build_nullspace_hooks_from_components(model_base, components):
-    pre_hooks = []
-    hooks = []
-    for comp in components:
-        layer = int(comp['layer'])
-        pre_hooks.append((
-            model_base.model_block_modules[layer],
-            get_nullspace_projection_input_pre_hook(comp['P']),
-        ))
-        hooks.append((
-            model_base.model_attn_modules[layer],
-            get_nullspace_projection_output_hook(comp['P']),
-        ))
-        hooks.append((
-            model_base.model_mlp_modules[layer],
-            get_nullspace_projection_output_hook(comp['P']),
-        ))
-    return pre_hooks, hooks
 
 
 def _make_ablation_component(row, candidate_directions):
@@ -500,9 +460,9 @@ def _run_inference(cfg, model_path):
 
     # Ablation: best direction (filtered rank-1) at top-k layers (unfiltered)
     # Nullspace: per-component P at top-k layers (unfiltered)
-    ablation_fwd_pre_hooks, ablation_fwd_hooks = _build_ablation_hooks_from_components(
+    ablation_fwd_pre_hooks, ablation_fwd_hooks = get_direction_ablation_hooks(
         model_base, selected_ablation_layers, best_direction)
-    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = _build_nullspace_hooks_from_components(
+    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
         model_base, selected_inlp_layers)
 
     # 3a. Generate and save completions on harmful evaluation datasets
@@ -766,9 +726,9 @@ def _run_inference_from_existing(cfg, model_path):
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
 
-    ablation_fwd_pre_hooks, ablation_fwd_hooks = _build_ablation_hooks_from_components(
+    ablation_fwd_pre_hooks, ablation_fwd_hooks = get_direction_ablation_hooks(
         model_base, selected_ablation_layers, best_direction)
-    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = _build_nullspace_hooks_from_components(
+    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
         model_base, selected_inlp_layers)
 
     # 3a. Generate and save completions on harmful evaluation datasets

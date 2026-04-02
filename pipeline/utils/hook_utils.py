@@ -88,6 +88,26 @@ def get_all_direction_ablation_hooks(
 
     return fwd_pre_hooks, fwd_hooks
 
+def get_direction_ablation_hooks(model_base, components, direction):
+    """Build ablation hooks applying ``direction`` at each component's layer."""
+    pre_hooks = []
+    hooks = []
+    for comp in components:
+        layer = int(comp['layer'])
+        pre_hooks.append((
+            model_base.model_block_modules[layer],
+            get_direction_ablation_input_pre_hook(direction=direction),
+        ))
+        hooks.append((
+            model_base.model_attn_modules[layer],
+            get_direction_ablation_output_hook(direction=direction),
+        ))
+        hooks.append((
+            model_base.model_mlp_modules[layer],
+            get_direction_ablation_output_hook(direction=direction),
+        ))
+    return pre_hooks, hooks
+
 def get_directional_patching_input_pre_hook(direction: Float[Tensor, "d_model"], coeff: Float[Tensor, ""]):
     def hook_fn(module, input):
         nonlocal direction
@@ -199,6 +219,25 @@ def get_all_nullspace_projection_hooks(
     ]
     return fwd_pre_hooks, fwd_hooks
 
+def get_nullspace_projection_hooks(model_base, components):
+    pre_hooks = []
+    hooks = []
+    for comp in components:
+        layer = int(comp['layer'])
+        pre_hooks.append((
+            model_base.model_block_modules[layer],
+            get_nullspace_projection_input_pre_hook(comp['P']),
+        ))
+        hooks.append((
+            model_base.model_attn_modules[layer],
+            get_nullspace_projection_output_hook(comp['P']),
+        ))
+        hooks.append((
+            model_base.model_mlp_modules[layer],
+            get_nullspace_projection_output_hook(comp['P']),
+        ))
+    return pre_hooks, hooks
+
 
 # ─── Per-layer (component-specific) direction hooks ───────────────────────────
 
@@ -258,3 +297,4 @@ def get_all_activation_addition_hooks_per_layer(
         for l in range(n_layers)
     ]
     return fwd_pre_hooks, []
+
