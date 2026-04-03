@@ -28,7 +28,11 @@ class Config:
     inlp_k_restrict: Optional[int] = None
     # Intervention mode
     intervention_mode: str = 'both'       # 'actadd', 'reflection', or 'both'
-    reflection_alphas: Tuple[float, ...] = (1.0, 1.5, 2.0)
+    reflection_alphas: Tuple[float, ...] = (1.0, 2.0)
+    # Benchmark evaluation sizes (-1 = all available)
+    benchmark_n_mmlu: int = 500        # sample for speed (~57 subjects)
+    benchmark_n_arc: int = -1          # full ARC-Challenge test (~1172)
+    benchmark_n_truthfulqa: int = -1   # full TruthfulQA validation (~817)
 
     def extraction_path(self) -> str:
         """Path for shared extraction artifacts (dataset splits, mean-diff directions, INLP activations).

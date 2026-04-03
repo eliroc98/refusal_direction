@@ -583,7 +583,7 @@ def select_direction_inlp_ranked(
         artifact_dir=artifact_dir,
         artifact_name='inlp_kl_div_scores',
     )
-    all_scores.sort(key=lambda x: (-x['sorting_score'], -x['first_classifier_acc'], x['position'], x['layer']))
+    all_scores.sort(key=lambda x: (-x['first_classifier_acc'], -x['sorting_score'], x['position'], x['layer']))
     if len(filtered_scores) == 0:
         if len(all_scores) == 0:
             print("WARNING: No valid INLP direction found at any (pos, layer). INLP interventions will be skipped.")
@@ -595,19 +595,19 @@ def select_direction_inlp_ranked(
         print(f"  • kl_threshold={kl_threshold}: {sum(1 for x in all_scores if x['kl_div_score'] > kl_threshold)} directions exceed KL limit")
         print(f"  • prune_layer_percentage={prune_layer_percentage}: {sum(1 for x in all_scores if x['layer'] >= int(n_layers * (1.0 - prune_layer_percentage)))} directions in pruned layers")
 
-        # Rank by: lowest refusal_score, then lowest kl_div_score, then highest steering_score
+        # Rank by: lowest refusal_score, then lowest kl_div_score, then best accuracy,then highest steering_score
         fallback = sorted(
             all_scores,
-            key=lambda x: (x['refusal_score'], x['kl_div_score'], -x['first_classifier_acc'], -x['steering_score']),
+            key=lambda x: (-x['first_classifier_acc'], x['refusal_score'], x['kl_div_score'], -x['steering_score']),
         )
         filtered_scores.append(fallback[0])
         print(
             f"  Fallback selected: pos={fallback[0]['position']}, layer={fallback[0]['layer']}, "
             f"refusal={fallback[0]['refusal_score']:.4f}, kl={fallback[0]['kl_div_score']:.4f}, "
-            f"steering={fallback[0]['steering_score']:.4f}"
+            f"steering={fallback[0]['steering_score']:.4f}, accuracy={fallback[0]['first_classifier_acc']:.4f}"
         )
 
-    filtered_scores.sort(key=lambda x: (-x['sorting_score'], -x['first_classifier_acc'], x['position'], x['layer']))
+    filtered_scores.sort(key=lambda x: (-x['first_classifier_acc'],-x['sorting_score'], x['position'], x['layer']))
 
     def _json_row(x):
         return {
@@ -634,7 +634,8 @@ def select_direction_inlp_ranked(
         f"(harmful baseline={baseline_refusal_harmful:.4f}, "
         f"harmless steering baseline={baseline_refusal_harmless:.4f}, "
         f"harmless steering={best['steering_score']:.4f}, "
-        f"kl={best['kl_div_score']:.4f})"
+        f"kl={best['kl_div_score']:.4f}), "
+        f"first_classifier_acc={best['first_classifier_acc']:.4f}, "
     )
     print(f"INLP pool sizes: all={len(all_scores)}, filtered={len(filtered_scores)}")
 

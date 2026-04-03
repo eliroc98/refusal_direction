@@ -31,6 +31,7 @@ from pipeline.submodules.generate_directions_inlp import (
 from pipeline.submodules.select_direction import select_direction_ranked, get_refusal_scores
 from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
 from pipeline.submodules.evaluate_loss import evaluate_loss
+from pipeline.submodules.evaluate_benchmarks import evaluate_benchmarks
 
 ACTADD_TARGET_MULTIPLIERS = [0.5, 1.0, 2.0]
 
@@ -374,6 +375,19 @@ def evaluate_loss_for_datasets(cfg, model_base, fwd_pre_hooks, fwd_hooks, interv
     with open(f'{cfg.artifact_path()}/loss_evals/{intervention_label}_loss_eval.json', "w") as f:
         json.dump(loss_evals, f, indent=4)
 
+
+def evaluate_benchmarks_for_datasets(cfg, model_base, fwd_pre_hooks, fwd_hooks, intervention_label):
+    """Evaluate MMLU, ARC, and TruthfulQA benchmarks for a given intervention."""
+    os.makedirs(os.path.join(cfg.artifact_path(), 'benchmark_evals'), exist_ok=True)
+    evals = evaluate_benchmarks(
+        model_base, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
+        n_mmlu=cfg.benchmark_n_mmlu, n_arc=cfg.benchmark_n_arc,
+        n_truthfulqa=cfg.benchmark_n_truthfulqa,
+        intervention_label=intervention_label,
+    )
+    with open(f'{cfg.artifact_path()}/benchmark_evals/{intervention_label}_benchmark_eval.json', 'w') as f:
+        json.dump(evals, f, indent=4)
+
 def _run_inference(cfg, model_path):
     """Steps 1-5: model loading, direction extraction, completions, and loss evaluation."""
     model_base = construct_model_base(cfg.model_path, device=cfg.device)
@@ -535,19 +549,24 @@ def _run_inference(cfg, model_path):
 
     # 5. Evaluate loss on harmless datasets for all interventions
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
+    evaluate_benchmarks_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
     evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
+    evaluate_benchmarks_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
     evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
+    evaluate_benchmarks_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
 
     for coeff in actadd_coeffs:
         label = f'actadd_c{coeff:.2f}'
         hooks_pre = [(model_base.model_block_modules[best_layer],
                       get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, hooks_pre, [], label)
+        evaluate_benchmarks_for_datasets(cfg, model_base, hooks_pre, [], label)
 
         inlp_label = f'inlp_actadd_c{coeff:.2f}'
         inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
                             get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
+        evaluate_benchmarks_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
 
     if cfg.intervention_mode in ('reflection', 'both'):
         for alpha in cfg.reflection_alphas:
@@ -555,13 +574,13 @@ def _run_inference(cfg, model_path):
             refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
                 model_base, P_optimal, alpha=alpha)
             evaluate_loss_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
+            evaluate_benchmarks_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
 
     # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
     model_base.del_model()
     del model_base
     del candidate_directions, best_direction, direction_unit
-    if has_inlp:
-        del best_inlp_direction, inlp_direction_unit
+    del best_inlp_direction, inlp_direction_unit
     del all_ablation, all_inlp, filtered_ablation, filtered_inlp
     del selected_ablation_layers, selected_inlp_layers
     del baseline_fwd_pre_hooks, baseline_fwd_hooks
@@ -753,8 +772,7 @@ def _run_inference_from_existing(cfg, model_path):
     best_inlp_layer = filtered_inlp[0]['layer']
 
     print(
-        f"Loaded ranked multi-component artifacts from {extraction_path} with shared_count={shared_count} "
-        f"(targets: ablation={target_ablation}, inlp={target_inlp})."
+        f"Loaded ranked multi-component artifacts from {extraction_path} with shared_count={shared_count}"
     )
     # --- Load model ---
     model_base = construct_model_base(cfg.model_path, device=cfg.device)
@@ -850,19 +868,24 @@ def _run_inference_from_existing(cfg, model_path):
 
     # 5. Evaluate loss on harmless datasets for all interventions
     evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
+    evaluate_benchmarks_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
     evaluate_loss_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
+    evaluate_benchmarks_for_datasets(cfg, model_base, ablation_fwd_pre_hooks, ablation_fwd_hooks, 'ablation')
     evaluate_loss_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
+    evaluate_benchmarks_for_datasets(cfg, model_base, nullspace_fwd_pre_hooks, nullspace_fwd_hooks, 'nullspace')
 
     for coeff in actadd_coeffs:
         label = f'actadd_c{coeff:.2f}'
         hooks_pre = [(model_base.model_block_modules[best_layer],
                       get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, hooks_pre, [], label)
+        evaluate_benchmarks_for_datasets(cfg, model_base, hooks_pre, [], label)
 
         inlp_label = f'inlp_actadd_c{coeff:.2f}'
         inlp_hooks_pre = [(model_base.model_block_modules[best_inlp_layer],
                             get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
         evaluate_loss_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
+        evaluate_benchmarks_for_datasets(cfg, model_base, inlp_hooks_pre, [], inlp_label)
 
     if cfg.intervention_mode in ('reflection', 'both'):
         for alpha in cfg.reflection_alphas:
@@ -870,13 +893,13 @@ def _run_inference_from_existing(cfg, model_path):
             refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
                 model_base, P_optimal, alpha=alpha)
             evaluate_loss_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
+            evaluate_benchmarks_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
 
     # Free ALL GPU resources before loading LlamaGuard2 for evaluation.
     model_base.del_model()
     del model_base
     del best_direction, direction_unit
-    if has_inlp:
-        del best_inlp_direction, inlp_direction_unit
+    del best_inlp_direction, inlp_direction_unit
     del selected_ablation_layers, selected_inlp_layers
     del baseline_fwd_pre_hooks, baseline_fwd_hooks
     del ablation_fwd_pre_hooks, ablation_fwd_hooks
