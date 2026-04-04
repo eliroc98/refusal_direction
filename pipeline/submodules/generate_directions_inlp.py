@@ -25,8 +25,11 @@ from jaxtyping import Float
 from torch import Tensor
 from tqdm import tqdm
 
-from pipeline.utils.hook_utils import add_hooks, get_nullspace_projection_input_pre_hook, get_activation_addition_input_pre_hook
 from pipeline.model_utils.model_base import ModelBase
+from pipeline.utils.nnsight_interventions import (
+    make_nullspace_interventions,
+    make_actadd_interventions,
+)
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -138,14 +141,12 @@ def _run_inlp(
 # ─── Activation extraction ────────────────────────────────────────────────────
 
 def get_all_activations(
-    model,
+    model_base: ModelBase,
     instructions: List[str],
-    tokenize_instructions_fn,
-    block_modules: List[torch.nn.Module],
     batch_size: int = 32,
     positions: List[int] = [-1],
 ) -> Float[Tensor, "n_instructions n_positions n_layers d_model"]:
-    """Extract per-instruction residual-stream activations at every layer.
+    """Extract per-instruction residual-stream activations at every layer using nnsight vLLM tracing.
 
     Parameters
     ----------
@@ -157,28 +158,36 @@ def get_all_activations(
     Tensor of shape (n_instructions, n_positions, n_layers, d_model), float32, on CPU.
     """
     torch.cuda.empty_cache()
-    n_layers = len(block_modules)
+    n_layers = model_base.n_layers
+    # cache[layer] will collect (1, n_pos, d_model) tensors per instruction.
     cache: List[List[Tensor]] = [[] for _ in range(n_layers)]
 
-    def _make_pre_hook(layer_idx: int):
-        def hook_fn(module, input):
-            act = input[0].detach().cpu().float()   # (batch, seq_len, d_model)
-            cache[layer_idx].append(act[:, positions, :])  # (batch, n_pos, d_model)
-        return hook_fn
-
-    fwd_pre_hooks = [(block_modules[l], _make_pre_hook(l)) for l in range(n_layers)]
-
     for i in tqdm(range(0, len(instructions), batch_size), desc="Extracting activations"):
-        inputs = tokenize_instructions_fn(instructions=instructions[i:i + batch_size])
-        with torch.no_grad(), add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=[]):
-            model(
-                input_ids=inputs.input_ids.to(model.device),
-                attention_mask=inputs.attention_mask.to(model.device),
-            )
+        batch = instructions[i:i + batch_size]
+        prompts = [model_base.format_instruction_fn(inst) for inst in batch]
 
-    # Stack: (n_inst, n_pos, d_model) per layer → (n_inst, n_pos, n_layers, d_model)
+        with torch.no_grad():
+            with model_base.nnsight_model.trace() as tracer:
+                per_sample_acts = []
+                for prompt in prompts:
+                    with tracer.invoke(prompt, temperature=0.0, top_p=1):
+                        sample_acts = []
+                        for layer in range(n_layers):
+                            act = model_base._get_block_proxy(layer).input[0].save()
+                            sample_acts.append(act)
+                        per_sample_acts.append(sample_acts)
+
+        for s_idx, sample_acts in enumerate(per_sample_acts):
+            for layer in range(n_layers):
+                act = sample_acts[layer].value
+                if act.dim() == 3:
+                    act = act.squeeze(0)               # (seq_len, d_model)
+                act_at_pos = act[positions, :].cpu().float()  # (n_pos, d_model)
+                cache[layer].append(act_at_pos.unsqueeze(0))  # (1, n_pos, d_model)
+
+    # Stack: per_layer[l] → (n_inst, n_pos, d_model)
     per_layer = [torch.cat(cache[l], dim=0) for l in range(n_layers)]
-    return torch.stack(per_layer, dim=2)
+    return torch.stack(per_layer, dim=2)  # (n_inst, n_pos, n_layers, d_model)
 
 
 # ─── Main direction extraction ────────────────────────────────────────────────
@@ -206,15 +215,13 @@ def generate_directions_inlp(
 
     print("INLP: extracting harmful activations …")
     harmful_acts = get_all_activations(
-        model_base.model, harmful_instructions,
-        model_base.tokenize_instructions_fn, model_base.model_block_modules,
+        model_base, harmful_instructions,
         batch_size=batch_size, positions=positions,
     )   # (n_harmful, n_pos, n_layers, d_model)
 
     print("INLP: extracting harmless activations …")
     harmless_acts = get_all_activations(
-        model_base.model, harmless_instructions,
-        model_base.tokenize_instructions_fn, model_base.model_block_modules,
+        model_base, harmless_instructions,
         batch_size=batch_size, positions=positions,
     )   # (n_harmless, n_pos, n_layers, d_model)
 
@@ -224,7 +231,7 @@ def generate_directions_inlp(
 
     # Run INLP for every (pos, layer) pair
     n_pos = len(positions)
-    n_layers = model_base.model.config.num_hidden_layers
+    n_layers = model_base.n_layers
     n_min = min(harmful_acts.shape[0], harmless_acts.shape[0])
     harmful_acts = harmful_acts[:n_min]
     harmless_acts = harmless_acts[:n_min]
@@ -232,7 +239,7 @@ def generate_directions_inlp(
     Y = np.array([1] * n_min + [0] * n_min, dtype=np.int32)
     train_idx, val_idx = _split_train_val(2 * n_min, val_frac=val_frac)
 
-    device = next(model_base.model.parameters()).device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     inlp_params = {}
 
     for pos_idx in range(n_pos):
@@ -420,17 +427,15 @@ def select_direction_inlp_ranked(
     n_pos = len(positions)
     n_layers = results["n_layers"]
 
-    device = model_base.model.device
-
     # Baselines for reporting and filtering parity with mean-diff selection.
     baseline_refusal_harmful = get_refusal_scores(
-        model_base.model, harmful_instructions,
+        model_base, harmful_instructions,
         model_base.tokenize_instructions_fn, model_base.refusal_toks,
         batch_size=batch_size,
     ).mean().item()
 
     baseline_refusal_harmless = get_refusal_scores(
-        model_base.model, harmless_instructions,
+        model_base, harmless_instructions,
         model_base.tokenize_instructions_fn, model_base.refusal_toks,
         batch_size=batch_size,
     ).mean().item()
@@ -439,10 +444,8 @@ def select_direction_inlp_ranked(
     baseline_harmless_logits = None
     if kl_threshold is not None:
         baseline_harmless_logits = get_last_position_logits(
-            model=model_base.model,
-            tokenizer=model_base.tokenizer,
+            model_base=model_base,
             instructions=harmless_instructions,
-            tokenize_instructions_fn=model_base.tokenize_instructions_fn,
             batch_size=batch_size,
         )
 
@@ -476,12 +479,11 @@ def select_direction_inlp_ranked(
                 continue
 
             # Refusal score: nullspace projection P on harmful
-            nullspace_hooks = [(model_base.model_block_modules[layer_idx],
-                                get_nullspace_projection_input_pre_hook(P))]
+            nullspace_ivs = make_nullspace_interventions([layer_idx], P)
             refusal_score = get_refusal_scores(
-                model_base.model, harmful_instructions,
+                model_base, harmful_instructions,
                 model_base.tokenize_instructions_fn, model_base.refusal_toks,
-                fwd_pre_hooks=nullspace_hooks, fwd_hooks=[],
+                interventions=nullspace_ivs,
                 batch_size=batch_size,
             ).mean().item()
 
@@ -494,14 +496,12 @@ def select_direction_inlp_ranked(
             per_mult_scores = []
             for m in actadd_multipliers:
                 coeff = m * direction_norm  # positive: induce refusal on harmless
-                fwd_pre_hooks = [(model_base.model_block_modules[layer_idx],
-                                  get_activation_addition_input_pre_hook(
-                                      vector=first_dir_unit, coeff=coeff))]
+                actadd_ivs = make_actadd_interventions(layer_idx, first_dir_unit, coeff)
 
                 scores = get_refusal_scores(
-                    model_base.model, harmless_instructions,
+                    model_base, harmless_instructions,
                     model_base.tokenize_instructions_fn, model_base.refusal_toks,
-                    fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=[],
+                    interventions=actadd_ivs,
                     batch_size=batch_size,
                 )
                 per_mult_scores.append(scores.mean().item())
@@ -509,17 +509,13 @@ def select_direction_inlp_ranked(
             steering_score = float(torch.tensor(per_mult_scores).max())
 
             # KL filtering: apply nullspace projection P, measure distortion on harmless
-            nullspace_fwd_pre_hooks = [(model_base.model_block_modules[layer_idx],
-                                        get_nullspace_projection_input_pre_hook(P))]
             kl = 0.0
             if baseline_harmless_logits is not None:
+                nullspace_kl_ivs = make_nullspace_interventions([layer_idx], P)
                 intervention_logits = get_last_position_logits(
-                    model=model_base.model,
-                    tokenizer=model_base.tokenizer,
+                    model_base=model_base,
                     instructions=harmless_instructions,
-                    tokenize_instructions_fn=model_base.tokenize_instructions_fn,
-                    fwd_pre_hooks=nullspace_fwd_pre_hooks,
-                    fwd_hooks=[],
+                    interventions=nullspace_kl_ivs,
                     batch_size=batch_size,
                 )
                 kl = kl_div_fn(

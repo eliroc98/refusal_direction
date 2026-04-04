@@ -2,7 +2,7 @@
 import torch
 import functools
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from typing import List
 from torch import Tensor
 from jaxtyping import Int, Float
@@ -93,29 +93,18 @@ def act_add_llama3_weights(model, direction: Float[Tensor, "d_model"], coeff, la
 
 class Llama3Model(ModelBase):
 
-    def _load_model(self, model_path, dtype=torch.bfloat16):
+    def _get_dtype_str(self) -> str:
+        return 'bfloat16'
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            device_map=self.device,
-        ).eval()
-
-        model.requires_grad_(False) 
-
-        return model
-
-    def _load_tokenizer(self, model_path):
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-        tokenizer.padding_side = "left"
-        tokenizer.pad_token = tokenizer.eos_token
-
-        return tokenizer
+    def _configure_tokenizer(self):
+        self.tokenizer.padding_side = "left"
+        self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def _get_tokenize_instructions_fn(self):
         return functools.partial(tokenize_instructions_llama3_chat, tokenizer=self.tokenizer, system=None, include_trailing_whitespace=True)
+
+    def _get_format_instruction_fn(self):
+        return functools.partial(format_instruction_llama3_chat, system=None, include_trailing_whitespace=True)
 
     def _get_eoi_toks(self):
         return self.tokenizer.encode(LLAMA3_CHAT_TEMPLATE.split("{instruction}")[-1], add_special_tokens=False)
@@ -123,17 +112,19 @@ class Llama3Model(ModelBase):
     def _get_refusal_toks(self):
         return LLAMA3_REFUSAL_TOKS
 
-    def _get_model_block_modules(self):
-        return self.model.model.layers
-
-    def _get_attn_modules(self):
-        return torch.nn.ModuleList([block_module.self_attn for block_module in self.model_block_modules])
-    
-    def _get_mlp_modules(self):
-        return torch.nn.ModuleList([block_module.mlp for block_module in self.model_block_modules])
-
     def _get_orthogonalization_mod_fn(self, direction: Float[Tensor, "d_model"]):
         return functools.partial(orthogonalize_llama3_weights, direction=direction)
-    
+
     def _get_act_add_mod_fn(self, direction: Float[Tensor, "d_model"], coeff, layer):
         return functools.partial(act_add_llama3_weights, direction=direction, coeff=coeff, layer=layer)
+
+    # ── nnsight proxy accessors ────────────────────────────────────────────────
+
+    def _get_block_proxy(self, layer_idx: int):
+        return self.nnsight_model.model.layers[layer_idx]
+
+    def _get_attn_proxy(self, layer_idx: int):
+        return self.nnsight_model.model.layers[layer_idx].self_attn
+
+    def _get_mlp_proxy(self, layer_idx: int):
+        return self.nnsight_model.model.layers[layer_idx].mlp

@@ -3,7 +3,7 @@ import torch
 import functools
 
 from torch import Tensor
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from typing import List
 from jaxtyping import Float
 
@@ -46,7 +46,7 @@ def format_instruction_yi_chat(
 
     if not include_trailing_whitespace:
         formatted_instruction = formatted_instruction.rstrip()
-    
+
     if output is not None:
         formatted_instruction += output
 
@@ -97,30 +97,17 @@ def act_add_yi_weights(model, direction: Float[Tensor, "d_model"], coeff, layer)
 
 class YiModel(ModelBase):
 
-    def _load_model(self, model_path, dtype=torch.float16):
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            device_map=self.device,
-        ).eval()
+    def _get_dtype_str(self) -> str:
+        return 'float16'
 
-        model.requires_grad_(False) 
-
-        return model
-
-    def _load_tokenizer(self, model_path):
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            use_fast=False
-        )
-
-        tokenizer.padding_side = 'left'
-
-        return tokenizer
+    def _configure_tokenizer(self):
+        self.tokenizer.padding_side = 'left'
 
     def _get_tokenize_instructions_fn(self):
         return functools.partial(tokenize_instructions_yi_chat, tokenizer=self.tokenizer, system=None, include_trailing_whitespace=True)
+
+    def _get_format_instruction_fn(self):
+        return functools.partial(format_instruction_yi_chat, system=None, include_trailing_whitespace=True)
 
     def _get_eoi_toks(self):
         return self.tokenizer.encode(YI_CHAT_TEMPLATE.split("{instruction}")[-1])
@@ -128,17 +115,19 @@ class YiModel(ModelBase):
     def _get_refusal_toks(self):
         return YI_REFUSAL_TOKS
 
-    def _get_model_block_modules(self):
-        return self.model.model.layers
-
-    def _get_attn_modules(self):
-        return torch.nn.ModuleList([block_module.self_attn for block_module in self.model_block_modules])
-    
-    def _get_mlp_modules(self):
-        return torch.nn.ModuleList([block_module.mlp for block_module in self.model_block_modules])
-
     def _get_orthogonalization_mod_fn(self, direction: Float[Tensor, "d_model"]):
         return functools.partial(orthogonalize_yi_weights, direction=direction)
-    
+
     def _get_act_add_mod_fn(self, direction: Float[Tensor, "d_model"], coeff, layer):
         return functools.partial(act_add_yi_weights, direction=direction, coeff=coeff, layer=layer)
+
+    # ── nnsight proxy accessors ────────────────────────────────────────────────
+
+    def _get_block_proxy(self, layer_idx: int):
+        return self.nnsight_model.model.layers[layer_idx]
+
+    def _get_attn_proxy(self, layer_idx: int):
+        return self.nnsight_model.model.layers[layer_idx].self_attn
+
+    def _get_mlp_proxy(self, layer_idx: int):
+        return self.nnsight_model.model.layers[layer_idx].mlp

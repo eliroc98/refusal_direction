@@ -3,7 +3,7 @@ import torch
 import functools
 
 from torch import Tensor
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from typing import List
 from torch import Tensor
 from jaxtyping import Int, Float
@@ -44,7 +44,7 @@ def format_instruction_qwen_chat(
 
     if not include_trailing_whitespace:
         formatted_instruction = formatted_instruction.rstrip()
-    
+
     if output is not None:
         formatted_instruction += output
 
@@ -95,43 +95,22 @@ def act_add_qwen_weights(model, direction: Float[Tensor, "d_model"], coeff, laye
 
 class QwenModel(ModelBase):
 
-    def _load_model(self, model_path, dtype=torch.float16):
-        model_kwargs = {}
-        model_kwargs.update({"use_flash_attn": True})
-        if dtype != "auto":
-            model_kwargs.update({
-                "bf16": dtype==torch.bfloat16,
-                "fp16": dtype==torch.float16,
-                "fp32": dtype==torch.float32,
-            })
+    def _get_dtype_str(self) -> str:
+        return 'float16'
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            device_map=self.device,
-            **model_kwargs,
-        ).eval()
+    def _get_vllm_kwargs(self) -> dict:
+        return {}
 
-        model.requires_grad_(False) 
-
-        return model
-
-    def _load_tokenizer(self, model_path):
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            use_fast=False
-        )
-
-        tokenizer.padding_side = 'left'
-        tokenizer.pad_token = '<|extra_0|>'
-        tokenizer.pad_token_id = tokenizer.eod_id # See https://github.com/QwenLM/Qwen/blob/main/FAQ.md#tokenizer
-
-        return tokenizer
+    def _configure_tokenizer(self):
+        self.tokenizer.padding_side = 'left'
+        self.tokenizer.pad_token = '<|extra_0|>'
+        self.tokenizer.pad_token_id = self.tokenizer.eod_id
 
     def _get_tokenize_instructions_fn(self):
         return functools.partial(tokenize_instructions_qwen_chat, tokenizer=self.tokenizer, system=None, include_trailing_whitespace=True)
+
+    def _get_format_instruction_fn(self):
+        return functools.partial(format_instruction_qwen_chat, system=None, include_trailing_whitespace=True)
 
     def _get_eoi_toks(self):
         return self.tokenizer.encode(QWEN_CHAT_TEMPLATE.split("{instruction}")[-1])
@@ -139,17 +118,22 @@ class QwenModel(ModelBase):
     def _get_refusal_toks(self):
         return QWEN_REFUSAL_TOKS
 
-    def _get_model_block_modules(self):
-        return self.model.transformer.h
-
-    def _get_attn_modules(self):
-        return torch.nn.ModuleList([block_module.attn for block_module in self.model_block_modules])
-    
-    def _get_mlp_modules(self):
-        return torch.nn.ModuleList([block_module.mlp for block_module in self.model_block_modules])
-
     def _get_orthogonalization_mod_fn(self, direction: Float[Tensor, "d_model"]):
         return functools.partial(orthogonalize_qwen_weights, direction=direction)
-    
+
     def _get_act_add_mod_fn(self, direction: Float[Tensor, "d_model"], coeff, layer):
         return functools.partial(act_add_qwen_weights, direction=direction, coeff=coeff, layer=layer)
+
+    # ── nnsight proxy accessors (Qwen 1.x GPT-style architecture) ─────────────
+
+    def _get_block_proxy(self, layer_idx: int):
+        return self.nnsight_model.transformer.h[layer_idx]
+
+    def _get_attn_proxy(self, layer_idx: int):
+        return self.nnsight_model.transformer.h[layer_idx].attn
+
+    def _get_mlp_proxy(self, layer_idx: int):
+        return self.nnsight_model.transformer.h[layer_idx].mlp
+
+    def _get_lm_head_proxy(self):
+        return self.nnsight_model.lm_head
