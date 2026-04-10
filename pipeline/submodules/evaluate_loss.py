@@ -1,6 +1,7 @@
 import torch
 import itertools
 import json
+import time
 
 from datasets import load_dataset
 
@@ -65,7 +66,24 @@ def batch_iterator_alpaca(tokenize_instructions_fn, batch_size, eoi_toks):
 
 def batch_iterator_pile(tokenizer, batch_size, max_length):
     """Yields batches from the Pile dataset."""
-    dataset = load_dataset("monology/pile-uncopyrighted", split="train", streaming=True, trust_remote_code=True)
+    dataset = None
+    max_retries = 3
+    retry_delay = 5  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            print(f"Loading pile-uncopyrighted in streaming mode (attempt {attempt + 1}/{max_retries})...")
+            dataset = load_dataset("monology/pile-uncopyrighted", split="train", streaming=True, trust_remote_code=True)
+            print("Successfully loaded pile-uncopyrighted")
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Connection attempt {attempt + 1} failed: {e}")
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print(f"All {max_retries} connection attempts failed")
+                raise e
 
     it_dataset = iter(dataset)
     while True:

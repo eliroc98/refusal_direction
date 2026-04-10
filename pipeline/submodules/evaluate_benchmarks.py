@@ -153,6 +153,8 @@ def _evaluate_arc(model_base: ModelBase, fwd_pre_hooks, fwd_hooks, n_samples):
 
 
 def _evaluate_truthfulqa(model_base: ModelBase, fwd_pre_hooks, fwd_hooks, n_samples):
+    if n_samples == 0:
+        return None, 0  # Avoid loading the dataset if we're not evaluating
     model     = model_base.model
     tokenizer = model_base.tokenizer
     device    = model.device

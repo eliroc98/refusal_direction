@@ -157,15 +157,26 @@ def get_nullspace_projection_input_pre_hook(P: Union[np.ndarray, Tensor]):
     Applying P removes all information in the row-space of the INLP classifiers.
     """
     P_tensor = torch.as_tensor(P, dtype=torch.float32) if isinstance(P, np.ndarray) else P
+    P_T = P_tensor.T  # Pre-compute transpose once
+    P_device = None
+    P_dtype = None
+    P_cached = None
 
     def hook_fn(module, input):
+        nonlocal P_device, P_dtype, P_cached
+
         if isinstance(input, tuple):
             activation: Float[Tensor, "batch_size seq_len d_model"] = input[0]
         else:
             activation: Float[Tensor, "batch_size seq_len d_model"] = input
 
-        P_cast = P_tensor.to(dtype=activation.dtype, device=activation.device)
-        activation = torch.matmul(activation, P_cast.T)
+        # Cache P on the correct device/dtype to avoid repeated casting
+        if P_cached is None or P_device != activation.device or P_dtype != activation.dtype:
+            P_cached = P_T.to(dtype=activation.dtype, device=activation.device)
+            P_device = activation.device
+            P_dtype = activation.dtype
+
+        activation = torch.matmul(activation, P_cached)
 
         if isinstance(input, tuple):
             return (activation, *input[1:])
@@ -177,15 +188,26 @@ def get_nullspace_projection_input_pre_hook(P: Union[np.ndarray, Tensor]):
 def get_nullspace_projection_output_hook(P: Union[np.ndarray, Tensor]):
     """Post-hook that projects module outputs onto the nullspace of learned directions."""
     P_tensor = torch.as_tensor(P, dtype=torch.float32) if isinstance(P, np.ndarray) else P
+    P_T = P_tensor.T  # Pre-compute transpose once
+    P_device = None
+    P_dtype = None
+    P_cached = None
 
     def hook_fn(module, input, output):
+        nonlocal P_device, P_dtype, P_cached
+
         if isinstance(output, tuple):
             activation: Float[Tensor, "batch_size seq_len d_model"] = output[0]
         else:
             activation: Float[Tensor, "batch_size seq_len d_model"] = output
 
-        P_cast = P_tensor.to(dtype=activation.dtype, device=activation.device)
-        activation = torch.matmul(activation, P_cast.T)
+        # Cache P on the correct device/dtype to avoid repeated casting
+        if P_cached is None or P_device != activation.device or P_dtype != activation.dtype:
+            P_cached = P_T.to(dtype=activation.dtype, device=activation.device)
+            P_device = activation.device
+            P_dtype = activation.dtype
+
+        activation = torch.matmul(activation, P_cached)
 
         if isinstance(output, tuple):
             return (activation, *output[1:])
@@ -289,15 +311,26 @@ def get_counterfactual_reflection_input_pre_hook(P: Union[np.ndarray, Tensor], a
     P_tensor = torch.as_tensor(P, dtype=torch.float32) if isinstance(P, np.ndarray) else P.float()
     d = P_tensor.shape[0]
     P_alpha = alpha * P_tensor + (1.0 - alpha) * torch.eye(d, dtype=torch.float32)
+    P_alpha_T = P_alpha.T  # Pre-compute transpose once
+    P_device = None
+    P_dtype = None
+    P_cached = None
 
     def hook_fn(module, input):
+        nonlocal P_device, P_dtype, P_cached
+
         if isinstance(input, tuple):
             activation: Float[Tensor, "batch_size seq_len d_model"] = input[0]
         else:
             activation: Float[Tensor, "batch_size seq_len d_model"] = input
 
-        P_cast = P_alpha.to(dtype=activation.dtype, device=activation.device)
-        activation = torch.matmul(activation, P_cast.T)
+        # Cache P_alpha on the correct device/dtype to avoid repeated casting
+        if P_cached is None or P_device != activation.device or P_dtype != activation.dtype:
+            P_cached = P_alpha_T.to(dtype=activation.dtype, device=activation.device)
+            P_device = activation.device
+            P_dtype = activation.dtype
+
+        activation = torch.matmul(activation, P_cached)
 
         if isinstance(input, tuple):
             return (activation, *input[1:])
@@ -311,15 +344,26 @@ def get_counterfactual_reflection_output_hook(P: Union[np.ndarray, Tensor], alph
     P_tensor = torch.as_tensor(P, dtype=torch.float32) if isinstance(P, np.ndarray) else P.float()
     d = P_tensor.shape[0]
     P_alpha = alpha * P_tensor + (1.0 - alpha) * torch.eye(d, dtype=torch.float32)
+    P_alpha_T = P_alpha.T  # Pre-compute transpose once
+    P_device = None
+    P_dtype = None
+    P_cached = None
 
     def hook_fn(module, input, output):
+        nonlocal P_device, P_dtype, P_cached
+
         if isinstance(output, tuple):
             activation: Float[Tensor, "batch_size seq_len d_model"] = output[0]
         else:
             activation: Float[Tensor, "batch_size seq_len d_model"] = output
 
-        P_cast = P_alpha.to(dtype=activation.dtype, device=activation.device)
-        activation = torch.matmul(activation, P_cast.T)
+        # Cache P_alpha on the correct device/dtype to avoid repeated casting
+        if P_cached is None or P_device != activation.device or P_dtype != activation.dtype:
+            P_cached = P_alpha_T.to(dtype=activation.dtype, device=activation.device)
+            P_device = activation.device
+            P_dtype = activation.dtype
+
+        activation = torch.matmul(activation, P_cached)
 
         if isinstance(output, tuple):
             return (activation, *output[1:])
@@ -352,6 +396,31 @@ def get_all_counterfactual_reflection_hooks(
         for l in range(n_layers)
     ]
     return fwd_pre_hooks, fwd_hooks
+
+
+def get_counterfactual_reflection_hooks(model_base, components, alpha=1.0):
+    """Apply counterfactual reflection to selected INLP components only.
+
+    Same transformation as get_all_counterfactual_reflection_hooks but targets
+    only the layers present in *components* (like get_nullspace_projection_hooks).
+    """
+    pre_hooks = []
+    hooks = []
+    for comp in components:
+        layer = int(comp['layer'])
+        pre_hooks.append((
+            model_base.model_block_modules[layer],
+            get_counterfactual_reflection_input_pre_hook(comp['P'], alpha=alpha),
+        ))
+        hooks.append((
+            model_base.model_attn_modules[layer],
+            get_counterfactual_reflection_output_hook(comp['P'], alpha=alpha),
+        ))
+        hooks.append((
+            model_base.model_mlp_modules[layer],
+            get_counterfactual_reflection_output_hook(comp['P'], alpha=alpha),
+        ))
+    return pre_hooks, hooks
 
 
 def get_all_activation_addition_hooks_per_layer(

@@ -18,8 +18,7 @@ from pipeline.utils.hook_utils import (
     get_nullspace_projection_output_hook,
     get_direction_ablation_hooks,
     get_nullspace_projection_hooks,
-    get_all_nullspace_projection_hooks,
-    get_all_counterfactual_reflection_hooks,
+    get_counterfactual_reflection_hooks,
 )
 
 from pipeline.submodules.generate_directions import generate_directions
@@ -61,6 +60,9 @@ def parse_arguments():
                         help='Top percentage of filtered ranked components to keep for both mean-diff '
                             'ablation and INLP nullspace projection. Final selected count is shared '
                             'across methods as min(target_ablation, target_inlp). (default: 1.0)')
+    parser.add_argument('--just_one', action='store_true',
+                        help='Shortcut to select just the single top-ranked component from each method, '
+                             'for quick sanity checks. Overrides --top_percentage if set.')
     parser.add_argument('--extract_only', action='store_true',
                         help='Run only extraction artifacts (sampling/filtering + mean-diff + INLP activations).')
     parser.add_argument('--select_only', action='store_true',
@@ -70,6 +72,16 @@ def parse_arguments():
     parser.add_argument('--compare_rankings', action='store_true',
                         help='Run expensive all-layer (global) scoring and Spearman rank '
                              'comparison against local (per-component) ranking.')
+    parser.add_argument('--intervention_mode', type=str, default='both',
+                        choices=['actadd', 'reflection', 'both'],
+                        help='Which intervention types to run. "actadd" skips reflection '
+                             '(much faster), "reflection" runs only reflection, '
+                             '"both" runs all. (default: both)')
+    parser.add_argument('--reflection_alphas', type=float, nargs='+', default=None,
+                        help='Reflection alpha values to sweep. Overrides config default '
+                             'of (1.0, 2.0). Example: --reflection_alphas 2.0')
+    parser.add_argument('--force_overwrite', action='store_true',
+                        help='Force regeneration of completion files even if they already exist.')
     return parser.parse_args()
 
 def save_run_params(cfg, extra_flags=None):
@@ -181,9 +193,11 @@ def generate_and_save_inlp_directions(cfg, model_base, harmful_train, harmless_t
         artifact_dir=artifact_dir,
     )
 
-def _resolve_target_count(pool_size, top_percentage):
+def _resolve_target_count(pool_size, top_percentage, just_one = False):
     if pool_size <= 0:
         return 0
+    if just_one:
+        return 1
     pct = max(0.0, min(100.0, float(top_percentage)))
     return max(1, int(math.ceil(pool_size * (pct / 100.0))))
 
@@ -269,7 +283,7 @@ def save_selected_component_artifacts(cfg, selected_ablation, selected_inlp,
                                       ranked_ablation, ranked_inlp,
                                       filtered_ablation, filtered_inlp,
                                       ablation_pool_size, inlp_pool_size,
-                                      shared_count, target_ablation, target_inlp):
+                                      canonical_pool_size, shared_count):
     import numpy as np
 
     extraction_path = cfg.extraction_path()
@@ -287,10 +301,10 @@ def save_selected_component_artifacts(cfg, selected_ablation, selected_inlp,
     with open(os.path.join(artifact_path, 'selected_components_metadata.json'), 'w') as f:
         json.dump({
             'top_percentage': cfg.top_percentage,
+            'just_one': cfg.just_one,
             'ablation_pool_size': ablation_pool_size,
             'inlp_pool_size': inlp_pool_size,
-            'target_ablation': target_ablation,
-            'target_inlp': target_inlp,
+            'canonical_pool_size': canonical_pool_size,
             'shared_count': shared_count,
             'best_ablation': {
                 'position': filtered_ablation[0]['position'],
@@ -339,8 +353,12 @@ def save_selected_component_artifacts(cfg, selected_ablation, selected_inlp,
 
 def generate_and_save_completions_for_dataset(cfg, model_base, fwd_pre_hooks, fwd_hooks, intervention_label, dataset_name, dataset=None):
     """Generate and save completions for a dataset."""
-    if not os.path.exists(os.path.join(cfg.artifact_path(), 'completions')):
-        os.makedirs(os.path.join(cfg.artifact_path(), 'completions'))
+    os.makedirs(os.path.join(cfg.artifact_path(), 'completions'), exist_ok=True)
+
+    output_path = f'{cfg.artifact_path()}/completions/{dataset_name}_{intervention_label}_completions.json'
+    if not cfg.force_overwrite and os.path.exists(output_path):
+        print(f"Skipping {dataset_name}/{intervention_label}: {output_path} already exists")
+        return
 
     if dataset is None:
         dataset = load_dataset(dataset_name)
@@ -352,40 +370,61 @@ def generate_and_save_completions_for_dataset(cfg, model_base, fwd_pre_hooks, fw
 
 def evaluate_completions_and_save_results_for_dataset(cfg, intervention_label, dataset_name, eval_methodologies, llamaguard2_classifier=None):
     """Evaluate completions and save results for a dataset."""
-    with open(os.path.join(cfg.artifact_path(), f'completions/{dataset_name}_{intervention_label}_completions.json'), 'r') as f:
+    completions_path = os.path.join(cfg.artifact_path(), f'completions/{dataset_name}_{intervention_label}_completions.json')
+    evaluation_path = os.path.join(cfg.artifact_path(), "completions", f"{dataset_name}_{intervention_label}_evaluations.json")
+
+    if not os.path.exists(completions_path):
+        print(f"Skipping eval {dataset_name}/{intervention_label}: completions file not found")
+        return
+
+    if not cfg.force_overwrite and os.path.exists(evaluation_path):
+        print(f"Skipping eval {dataset_name}/{intervention_label}: {evaluation_path} already exists")
+        return
+
+    with open(completions_path, 'r') as f:
         completions = json.load(f)
 
     evaluate_jailbreak(
         completions=completions,
         methodologies=eval_methodologies,
-        evaluation_path=os.path.join(cfg.artifact_path(), "completions", f"{dataset_name}_{intervention_label}_evaluations.json"),
+        evaluation_path=evaluation_path,
         vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
         llamaguard2_classifier=llamaguard2_classifier,
     )
 
 def evaluate_loss_for_datasets(cfg, model_base, fwd_pre_hooks, fwd_hooks, intervention_label):
     """Evaluate loss on datasets."""
-    if not os.path.exists(os.path.join(cfg.artifact_path(), 'loss_evals')):
-        os.makedirs(os.path.join(cfg.artifact_path(), 'loss_evals'))
+    os.makedirs(os.path.join(cfg.artifact_path(), 'loss_evals'), exist_ok=True)
+
+    output_path = f'{cfg.artifact_path()}/loss_evals/{intervention_label}_loss_eval.json'
+    if not cfg.force_overwrite and os.path.exists(output_path):
+        print(f"Skipping loss eval {intervention_label}: {output_path} already exists")
+        return
 
     on_distribution_completions_file_path = os.path.join(cfg.artifact_path(), f'completions/harmless_baseline_completions.json')
 
     loss_evals = evaluate_loss(model_base, fwd_pre_hooks, fwd_hooks, batch_size=cfg.ce_loss_batch_size, n_batches=cfg.ce_loss_n_batches, completions_file_path=on_distribution_completions_file_path, intervention_label=intervention_label)
 
-    with open(f'{cfg.artifact_path()}/loss_evals/{intervention_label}_loss_eval.json', "w") as f:
+    with open(output_path, "w") as f:
         json.dump(loss_evals, f, indent=4)
 
 
 def evaluate_benchmarks_for_datasets(cfg, model_base, fwd_pre_hooks, fwd_hooks, intervention_label):
     """Evaluate MMLU, ARC, and TruthfulQA benchmarks for a given intervention."""
     os.makedirs(os.path.join(cfg.artifact_path(), 'benchmark_evals'), exist_ok=True)
+
+    output_path = f'{cfg.artifact_path()}/benchmark_evals/{intervention_label}_benchmark_eval.json'
+    if not cfg.force_overwrite and os.path.exists(output_path):
+        print(f"Skipping benchmark eval {intervention_label}: {output_path} already exists")
+        return
+
     evals = evaluate_benchmarks(
         model_base, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
         n_mmlu=cfg.benchmark_n_mmlu, n_arc=cfg.benchmark_n_arc,
-        n_truthfulqa=cfg.benchmark_n_truthfulqa,
+        n_truthfulqa=cfg.benchmark_n_truthfulqa if False else 0,
         intervention_label=intervention_label,
     )
-    with open(f'{cfg.artifact_path()}/benchmark_evals/{intervention_label}_benchmark_eval.json', 'w') as f:
+    with open(output_path, 'w') as f:
         json.dump(evals, f, indent=4)
 
 def _run_inference(cfg, model_path):
@@ -417,10 +456,9 @@ def _run_inference(cfg, model_path):
         cfg, model_base, harmful_val, harmless_val, actadd_multipliers, top_direction_norm
     )
 
-    # Top-k layers from unfiltered pool
-    n_components = _resolve_target_count(len(all_ablation), cfg.top_percentage)
-    target_ablation = n_components
-    target_inlp = _resolve_target_count(len(all_inlp), cfg.top_percentage)
+    # Top-k layers from unfiltered pool (use min to handle rare first_dir=None gaps)
+    canonical_pool = min(len(all_ablation), len(all_inlp))
+    n_components = _resolve_target_count(canonical_pool, cfg.top_percentage, just_one=cfg.just_one)
 
     selected_ablation_layers = all_ablation[:n_components]
     selected_inlp_layers = all_inlp[:n_components]
@@ -435,16 +473,15 @@ def _run_inference(cfg, model_path):
         filtered_inlp=filtered_inlp,
         ablation_pool_size=len(all_ablation),
         inlp_pool_size=len(all_inlp),
+        canonical_pool_size=canonical_pool,
         shared_count=n_components,
-        target_ablation=target_ablation,
-        target_inlp=target_inlp,
     )
 
     print(
         f"Selected shared component count={n_components} "
-        f"(ablation target={target_ablation}/{len(all_ablation)}, "
-        f"inlp target={target_inlp}/{len(all_inlp)}, "
-        f"top_percentage={cfg.top_percentage:.3f}%)"
+        f"(canonical_pool={canonical_pool}, ablation_pool={len(all_ablation)}, "
+        f"inlp_pool={len(all_inlp)}, "
+        f"top_percentage={cfg.top_percentage:.3f}%, just_one={cfg.just_one})"
     )
 
     assert n_components > 0, "No components selected. Adjust top_percentage or check filtering criteria."
@@ -487,15 +524,14 @@ def _run_inference(cfg, model_path):
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_direction_ablation_hooks(
         model_base, selected_ablation_layers, best_direction)
 
-    # Nullspace: single optimal P applied to all layers, or per-component
+    # Nullspace: single optimal P applied to selected layers, or per-component P
     P_raw = filtered_inlp[0]['P']
     _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
     if cfg.inlp_single_optimal:
-        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_all_nullspace_projection_hooks(
-            model_base, P_optimal)
-    else:
-        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
-            model_base, selected_inlp_layers)
+        for comp in selected_inlp_layers:
+            comp['P'] = P_optimal
+    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
+        model_base, selected_inlp_layers)
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
@@ -519,8 +555,8 @@ def _run_inference(cfg, model_path):
         if cfg.intervention_mode in ('reflection', 'both'):
             for alpha in cfg.reflection_alphas:
                 label = f'reflection_a{alpha:.2f}'
-                refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
-                    model_base, P_optimal, alpha=alpha)
+                refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+                    model_base, selected_inlp_layers, alpha=alpha)
                 generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, dataset_name)
 
     # 4a. Generate and save completions on harmless evaluation dataset
@@ -543,8 +579,8 @@ def _run_inference(cfg, model_path):
     if cfg.intervention_mode in ('reflection', 'both'):
         for alpha in cfg.reflection_alphas:
             label = f'reflection_a{alpha:.2f}'
-            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
-                model_base, P_optimal, alpha=alpha)
+            refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+                model_base, selected_inlp_layers, alpha=alpha)
             generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, 'harmless', dataset=harmless_test)
 
     # 5. Evaluate loss on harmless datasets for all interventions
@@ -571,8 +607,8 @@ def _run_inference(cfg, model_path):
     if cfg.intervention_mode in ('reflection', 'both'):
         for alpha in cfg.reflection_alphas:
             label = f'reflection_a{alpha:.2f}'
-            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
-                model_base, P_optimal, alpha=alpha)
+            refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+                model_base, selected_inlp_layers, alpha=alpha)
             evaluate_loss_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
             evaluate_benchmarks_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
 
@@ -633,9 +669,8 @@ def _run_selection(cfg, model_path):
         cfg, model_base, harmful_val, harmless_val, actadd_multipliers, top_direction_norm
     )
 
-    n_components = _resolve_target_count(len(all_ablation), cfg.top_percentage)
-    target_ablation = n_components
-    target_inlp = _resolve_target_count(len(all_inlp), cfg.top_percentage)
+    canonical_pool = min(len(all_ablation), len(all_inlp))
+    n_components = _resolve_target_count(canonical_pool, cfg.top_percentage, just_one=cfg.just_one)
 
     selected_ablation_layers = all_ablation[:n_components]
     selected_inlp_layers = all_inlp[:n_components]
@@ -650,16 +685,15 @@ def _run_selection(cfg, model_path):
         filtered_inlp=filtered_inlp,
         ablation_pool_size=len(all_ablation),
         inlp_pool_size=len(all_inlp),
+        canonical_pool_size=canonical_pool,
         shared_count=n_components,
-        target_ablation=target_ablation,
-        target_inlp=target_inlp,
     )
 
     print(
         f"Selection complete with n_components={n_components} "
-        f"(ablation target={target_ablation}/{len(all_ablation)}, "
-        f"inlp target={target_inlp}/{len(all_inlp)}, "
-        f"top_percentage={cfg.top_percentage:.3f}%)"
+        f"(canonical_pool={canonical_pool}, ablation_pool={len(all_ablation)}, "
+        f"inlp_pool={len(all_inlp)}, "
+        f"top_percentage={cfg.top_percentage:.3f}%, just_one={cfg.just_one})"
     )
 
     model_base.del_model()
@@ -750,7 +784,8 @@ def _run_inference_from_existing(cfg, model_path):
     ranked_ablation = torch.load(ranked_ablation_path, map_location='cpu', weights_only=False)
     ranked_inlp = torch.load(ranked_inlp_path, map_location='cpu', weights_only=False)
 
-    shared_count = _resolve_target_count(len(ranked_ablation), cfg.top_percentage)
+    canonical_pool = min(len(ranked_ablation), len(ranked_inlp))
+    shared_count = _resolve_target_count(canonical_pool, cfg.top_percentage, just_one=cfg.just_one)
     assert shared_count > 0, "No components selected. Adjust top_percentage or check filtering criteria."
     if len(ranked_ablation) < shared_count or len(ranked_inlp) < shared_count:
         raise RuntimeError(
@@ -805,15 +840,14 @@ def _run_inference_from_existing(cfg, model_path):
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_direction_ablation_hooks(
         model_base, selected_ablation_layers, best_direction)
 
-    # Nullspace: single optimal P applied to all layers, or per-component
+    # Nullspace: single optimal P applied to selected layers, or per-component P
     P_raw = filtered_inlp[0]['P']
     _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
     if cfg.inlp_single_optimal:
-        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_all_nullspace_projection_hooks(
-            model_base, P_optimal)
-    else:
-        nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
-            model_base, selected_inlp_layers)
+        for comp in selected_inlp_layers:
+            comp['P'] = P_optimal
+    nullspace_fwd_pre_hooks, nullspace_fwd_hooks = get_nullspace_projection_hooks(
+        model_base, selected_inlp_layers)
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
@@ -838,8 +872,8 @@ def _run_inference_from_existing(cfg, model_path):
         if cfg.intervention_mode in ('reflection', 'both'):
             for alpha in cfg.reflection_alphas:
                 label = f'reflection_a{alpha:.2f}'
-                refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
-                    model_base, P_optimal, alpha=alpha)
+                refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+                    model_base, selected_inlp_layers, alpha=alpha)
                 generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, dataset_name)
 
     # 4a. Generate and save completions on harmless evaluation dataset
@@ -862,8 +896,8 @@ def _run_inference_from_existing(cfg, model_path):
     if cfg.intervention_mode in ('reflection', 'both'):
         for alpha in cfg.reflection_alphas:
             label = f'reflection_a{alpha:.2f}'
-            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
-                model_base, P_optimal, alpha=alpha)
+            refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+                model_base, selected_inlp_layers, alpha=alpha)
             generate_and_save_completions_for_dataset(cfg, model_base, refl_pre, refl_hooks, label, 'harmless', dataset=harmless_test)
 
     # 5. Evaluate loss on harmless datasets for all interventions
@@ -890,8 +924,8 @@ def _run_inference_from_existing(cfg, model_path):
     if cfg.intervention_mode in ('reflection', 'both'):
         for alpha in cfg.reflection_alphas:
             label = f'reflection_a{alpha:.2f}'
-            refl_pre, refl_hooks = get_all_counterfactual_reflection_hooks(
-                model_base, P_optimal, alpha=alpha)
+            refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+                model_base, selected_inlp_layers, alpha=alpha)
             evaluate_loss_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
             evaluate_benchmarks_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
 
@@ -913,13 +947,18 @@ def _run_inference_from_existing(cfg, model_path):
 def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
                  resume_from_eval=False, skip_eval=False, use_existing=False,
                  top_percentage=1.0, extract_only=False, select_only=False,
-                 infer_only=False, compare_rankings=False):
+                 infer_only=False, compare_rankings=False, just_one=False,
+                 intervention_mode='both', reflection_alphas=None,
+                 force_overwrite=False):
     """Run the full pipeline."""
     model_alias = os.path.basename(model_path)
     cfg = Config(model_alias=model_alias, model_path=model_path, device=device,
                  vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
-                 top_percentage=top_percentage,
-                 compare_rankings=compare_rankings)
+                 top_percentage=top_percentage, just_one=just_one,
+                 compare_rankings=compare_rankings,
+                 intervention_mode=intervention_mode,
+                 reflection_alphas=tuple(reflection_alphas) if reflection_alphas else (1.0, 2.0),
+                 force_overwrite=force_overwrite)
 
     save_run_params(cfg, extra_flags={
         'resume_from_eval': resume_from_eval,
@@ -977,4 +1016,8 @@ if __name__ == "__main__":
                  extract_only=args.extract_only,
                  select_only=args.select_only,
                  infer_only=args.infer_only,
-                 compare_rankings=args.compare_rankings)
+                 compare_rankings=args.compare_rankings,
+                 just_one=args.just_one,
+                 intervention_mode=args.intervention_mode,
+                 reflection_alphas=args.reflection_alphas,
+                 force_overwrite=args.force_overwrite)

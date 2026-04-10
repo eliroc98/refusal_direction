@@ -22,6 +22,7 @@ class Config:
     ce_loss_batch_size: int = 2
     ce_loss_n_batches: int = 2048
     top_percentage: float = 1.0
+    just_one: bool = False
     compare_rankings: bool = False
     # Single optimal INLP projection
     inlp_single_optimal: bool = True
@@ -33,6 +34,7 @@ class Config:
     benchmark_n_mmlu: int = 500        # sample for speed (~57 subjects)
     benchmark_n_arc: int = -1          # full ARC-Challenge test (~1172)
     benchmark_n_truthfulqa: int = -1   # full TruthfulQA validation (~817)
+    force_overwrite: bool = False        # force regeneration of existing completion files
 
     def extraction_path(self) -> str:
         """Path for shared extraction artifacts (dataset splits, mean-diff directions, INLP activations).
@@ -41,6 +43,9 @@ class Config:
 
     def artifact_path(self) -> str:
         """Path for per-run artifacts (selected components, completions, loss evals).
-        Scoped by top_percentage so different runs are kept distinct."""
-        top_pct_str = f"top{self.top_percentage:g}"
-        return os.path.join(os.path.dirname(os.path.realpath(__file__)), "runs", self.model_alias, top_pct_str)
+        Scoped by top_percentage (or just_one) so different runs are kept distinct."""
+        if self.just_one:
+            subdir = "top_just1"
+        else:
+            subdir = f"top{self.top_percentage:g}"
+        return os.path.join(os.path.dirname(os.path.realpath(__file__)), "runs", self.model_alias, subdir)

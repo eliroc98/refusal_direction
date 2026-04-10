@@ -459,10 +459,6 @@ def select_direction_inlp_ranked(
         for layer_idx in tqdm(range(n_layers),
                                desc=f"INLP selection (pos {src_pos})"):
 
-            if (prune_layer_percentage is not None
-                    and layer_idx >= int(n_layers * (1.0 - prune_layer_percentage))):
-                continue
-
             key = f"({pos_idx}, {layer_idx})"
             if key not in inlp_params:
                 continue
