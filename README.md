@@ -1,77 +1,74 @@
-# Refusal in Language Models Is Mediated by a Single Direction
+# Removing Refusal in LLMs: Diff-in-Means vs. Iterative Nullspace Projection
 
 **Content warning**: This repository contains text that is offensive, harmful, or otherwise inappropriate in nature.
 
-This repository contains code and results accompanying the paper "Refusal in Language Models Is Mediated by a Single Direction".
-In the spirit of scientific reproducibility, we provide code to reproduce the main results from the paper.
+This project compares two approaches for extracting and manipulating the refusal direction in Large Language Models: the diff-in-means method from [Arditi et al. (2024)](https://arxiv.org/abs/2406.11717) and Iterative Nullspace Projection (INLP) from [Ravfogel et al. (2020)](https://aclanthology.org/2020.acl-main.647/). The codebase builds on the [original refusal_direction repository](https://github.com/andyrdt/refusal_direction) and extends it with INLP-based direction extraction, additional intervention types, and an expanded evaluation suite.
 
-- [Paper](https://arxiv.org/abs/2406.11717)
-- [Blog post](https://www.lesswrong.com/posts/jGuXSZgv6qfdhMCuJ/refusal-in-llms-is-mediated-by-a-single-direction)
+- [Write-up](https://docs.google.com/document/d/1s5TXaa0ddkekicoAngFqszzOaZjxw7QN/edit?rtpof=true)
+
+## Overview
+
+Diff-in-means extracts a single refusal direction by computing the difference between mean activations on harmful and harmless prompts. INLP takes a different approach: it iteratively trains linear classifiers to distinguish harmful from harmless representations, projecting out each identified direction until no linear classifier can separate the two. This removes a multi-dimensional subspace rather than a single vector, making no assumption about refusal being captured by one direction.
+
+The pipeline implements both methods side by side and compares them across several families of interventions, applied at varying scopes (single component, top 50%, or all components):
+
+- **Directional ablation** (diff-in-means): removes the single refusal direction from activations.
+- **Nullspace projection** (INLP): projects activations into the orthogonal complement of all identified refusal directions.
+- **Activation addition (ActAdd)**: steers the model by adding or subtracting a direction with configurable multipliers. Supported for both the diff-in-means direction and the first INLP classifier direction, scaled to the same norm for fair comparison.
+- **Counterfactual reflection** (INLP): reflects representations across the nullspace with configurable strength to produce counterfactual behavior.
+
+## Evaluation
+
+Each intervention is evaluated on both safety and performance metrics:
+
+- **Refusal score**: fraction of harmful prompts where the model does not refuse (substring matching).
+- **Safety score**: fraction of harmful-prompt responses judged unsafe by LlamaGuard 2.
+- **Refusal on harmless prompts**: fraction of harmless prompts the model incorrectly refuses.
+- **Perplexity**: cross-entropy loss on Pile (general text) and Alpaca (instruction-following).
+- **MMLU**: 5-shot accuracy on Massive Multitask Language Understanding.
+- **ARC**: 5-shot accuracy on ARC-Challenge.
 
 ## Setup
 
 ```bash
-git clone https://github.com/andyrdt/refusal_direction.git
+git clone https://github.com/eliroc98/refusal_direction.git
 cd refusal_direction
 source setup.sh
 ```
 
-The setup script will prompt you for a HuggingFace token (required to access gated models) and a Together AI token (required to access the Together AI API, which is used for evaluating jailbreak safety scores).
-It will then set up a virtual environment and install the required packages.
+The setup script will prompt you for a HuggingFace token (required to access gated models) and a Together AI token (used for evaluating jailbreak safety scores). It will then set up a virtual environment and install the required packages.
 
-## Reproducing main results
-
-To reproduce the main results from the paper, run the following command:
+## Running the pipeline
 
 ```bash
 python3 -m pipeline.run_pipeline --model_path {model_path}
 ```
-where `{model_path}` is the path to a HuggingFace model. For example, for Llama-3 8B Instruct, the model path would be `meta-llama/Meta-Llama-3-8B-Instruct`.
 
-The pipeline performs the following steps:
-1. Extract candiate refusal directions
-    - Artifacts will be saved in `pipeline/runs/{model_alias}/generate_directions`
-2. Select the most effective refusal direction
-    - Artifacts will be saved in `pipeline/runs/{model_alias}/select_direction`
-    - The selected refusal direction will be saved as `pipeline/runs/{model_alias}/direction.pt`
-3. Generate completions over harmful prompts, and evaluate refusal metrics.
-    - Artifacts will be saved in `pipeline/runs/{model_alias}/completions`
-4. Generate completions over harmless prompts, and evaluate refusal metrics.
-    - Artifacts will be saved in `pipeline/runs/{model_alias}/completions`
-5. Evaluate CE loss metrics.
-    - Artifacts will be saved in `pipeline/runs/{model_alias}/loss_evals`
+where `{model_path}` is the path to a HuggingFace model (e.g. `meta-llama/Meta-Llama-3-8B-Instruct`).
 
-For convenience, we have included pipeline artifacts for the smallest model in each model family:
-- [`qwen/qwen-1_8b-chat`](/pipeline/runs/qwen-1_8b-chat/)
-- [`google/gemma-2b-it`](/pipeline/runs/gemma-2b-it/)
-- [`01-ai/yi-6b-chat`](/pipeline/runs/yi-6b-chat/)
-- [`meta-llama/llama-2-7b-chat-hf`](/pipeline/runs/llama-2-7b-chat-hf/)
-- [`meta-llama/meta-llama-3-8b-instruct`](/pipeline/runs/meta-llama-3-8b-instruct/)
+The pipeline runs the following stages:
 
-## Minimal demo Colab
+1. **Extract** candidate refusal directions via diff-in-means and INLP.
+2. **Select** the best direction for each method by scoring candidates on refusal suppression, steering effectiveness, and KL divergence, applied locally at the source component.
+3. **Infer** completions over harmful and harmless prompts under each intervention.
+4. **Evaluate** CE loss, benchmark accuracy, and jailbreak metrics.
 
-As part of our [blog post](https://www.lesswrong.com/posts/jGuXSZgv6qfdhMCuJ/refusal-in-llms-is-mediated-by-a-single-direction), we included a minimal demo of bypassing refusal. This demo is available as a [Colab notebook](https://colab.research.google.com/drive/1a-aQvKC9avdZpdyBn4jgRQFObTPy1JZw).
+Artifacts are saved under `pipeline/runs/{model_alias}/`.
 
-## As featured in
+### Stage-level execution
 
-Since publishing our initial [blog post](https://www.lesswrong.com/posts/jGuXSZgv6qfdhMCuJ/refusal-in-llms-is-mediated-by-a-single-direction) in April 2024, our methodology has been independently reproduced and used many times. In particular, we acknowledge [Fail](https://huggingface.co/failspy)[Spy](https://x.com/failspy) for their work in reproducing and extending our methodology.
+The pipeline can be split into independent stages, which is useful when GPU memory is limited or when iterating on a specific phase:
 
-Our work has been featured in:
-- [HackerNews](https://news.ycombinator.com/item?id=40242939)
-- [Last Week in AI podcast](https://open.spotify.com/episode/2E3Fc50GVfPpBvJUmEwlOU)
-- [Llama 3 hackathon](https://x.com/AlexReibman/status/1789895080754491686)
-- [Applying refusal-vector ablation to a Llama 3 70B agent](https://www.lesswrong.com/posts/Lgq2DcuahKmLktDvC/applying-refusal-vector-ablation-to-a-llama-3-70b-agent)
-- [Uncensor any LLM with abliteration](https://huggingface.co/blog/mlabonne/abliteration)
+- `--extract_only`: run only direction extraction (stage 1).
+- `--select_only`: run only component selection from previously extracted artifacts (stage 2).
+- `--infer_only`: run only inference and evaluation from previously selected artifacts (stages 3–4).
+- `--use_existing`: skip extraction and selection, reuse pre-computed directions.
+- `--resume_from_eval`: skip inference, resume from jailbreak evaluation.
+- `--skip_eval`: run inference only, skip jailbreak evaluation.
 
+### Other options
 
-## Citing this work
-
-If you find this work useful in your research, please consider citing our [paper](https://arxiv.org/abs/2406.11717):
-```tex
-@article{arditi2024refusal,
-  title={Refusal in Language Models Is Mediated by a Single Direction},
-  author={Andy Arditi and Oscar Obeso and Aaquib Syed and Daniel Paleka and Nina Panickssery and Wes Gurnee and Neel Nanda},
-  journal={arXiv preprint arXiv:2406.11717},
-  year={2024}
-}
-```
+- `--top_percentage`: fraction of filtered ranked components to keep for ablation and nullspace projection (default: 1.0).
+- `--compare_rankings`: run the expensive all-layer (global) scoring alongside local scoring and compute the Spearman rank correlation between the two.
+- `--device`: device for model loading (`auto`, `cuda:0`, `cpu`).
+- `--vllm_gpu_memory_utilization`: fraction of GPU memory available to vLLM classifiers (default: 0.9).
