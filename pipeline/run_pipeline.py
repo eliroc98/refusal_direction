@@ -526,7 +526,10 @@ def _run_inference(cfg, model_path):
 
     # Nullspace: single optimal P applied to selected layers, or per-component P
     P_raw = filtered_inlp[0]['P']
-    _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
+    if cfg.inlp_k_restrict is None:
+        P_optimal = P_raw
+    else:
+        _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
     if cfg.inlp_single_optimal:
         for comp in selected_inlp_layers:
             comp['P'] = P_optimal
@@ -842,7 +845,10 @@ def _run_inference_from_existing(cfg, model_path):
 
     # Nullspace: single optimal P applied to selected layers, or per-component P
     P_raw = filtered_inlp[0]['P']
-    _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
+    if cfg.inlp_k_restrict is None:
+        P_optimal = P_raw
+    else:
+        _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
     if cfg.inlp_single_optimal:
         for comp in selected_inlp_layers:
             comp['P'] = P_optimal

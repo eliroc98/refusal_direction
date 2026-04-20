@@ -300,13 +300,14 @@ def get_directions_from_P(
         When k is None, P_k reproduces the original P up to numerical error.
     """
     d = P.shape[0]
-    I_minus_P = np.eye(d, dtype=np.float32) - P.astype(np.float32)
+    # Use float64 so k-restricted reconstructions are as stable as possible.
+    I_minus_P = np.eye(d, dtype=np.float64) - P.astype(np.float64)
     _, s, Vh = np.linalg.svd(I_minus_P, full_matrices=False)
     rank = int((s > 1e-6).sum())
     if k is not None:
         rank = min(k, rank)
     directions = Vh[:rank]                               # (rank, d)
-    P_k = np.eye(d, dtype=np.float32) - directions.T @ directions  # (d, d)
+    P_k = np.eye(d, dtype=np.float64) - directions.T @ directions  # (d, d)
     return directions, P_k
 
 
