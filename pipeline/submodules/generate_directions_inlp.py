@@ -83,9 +83,9 @@ def _run_inlp(
     Xdv = torch.from_numpy(X_dev).to(device=device, dtype=dtype)
     Ydv = torch.from_numpy(Y_dev)
 
-    first_dir: Optional[np.ndarray] = None
+    first_dir: Optional[torch.Tensor] = None
     accuracies: List[float] = []
-    classifier_dirs: List[np.ndarray] = []
+    classifier_dirs: List[torch.Tensor] = []
 
     Xtr_proj = Xtr.clone()
     Xdv_proj = Xdv.clone()
@@ -120,10 +120,10 @@ def _run_inlp(
             Wmat = -Wmat
         norm = Wmat.norm()
         Wunit = Wmat / (norm + 1e-12)
-        classifier_dirs.append(Wunit.squeeze(0).cpu().numpy())
+        classifier_dirs.append(Wunit.squeeze(0))
 
         if first_dir is None:
-            first_dir = Wunit.cpu().numpy()
+            first_dir = Wunit
 
         accuracies.append(acc)
         Q = Q + _get_rowspace_projection(Wunit)
@@ -145,8 +145,12 @@ def _run_inlp(
     if accuracies:
         print(f"INLP: {len(accuracies)} classifiers, accuracies = {[f'{a:.3f}' for a in accuracies]}")
 
-    classifier_dirs_arr = np.stack(classifier_dirs, axis=0) if classifier_dirs else np.zeros((0, d), dtype=np.float32)
-    return P_current.cpu().numpy(), first_dir, accuracies, classifier_dirs_arr
+    if classifier_dirs:
+        classifier_dirs_arr = torch.stack(classifier_dirs, dim=0).cpu().numpy()
+    else:
+        classifier_dirs_arr = np.zeros((0, d), dtype=np.float32)
+    first_dir_np = first_dir.cpu().numpy() if first_dir is not None else None
+    return P_current.cpu().numpy(), first_dir_np, accuracies, classifier_dirs_arr
 
 
 # ─── Activation extraction ────────────────────────────────────────────────────
@@ -207,6 +211,7 @@ def generate_directions_inlp(
     min_accuracy: float = 0.55,
     val_frac: float = 0.3,
     prune_layer_percentage: Optional[float] = 0.20,
+    offload_model: bool = False,
 ) -> None:
     """Extract activations and compute INLP for all (pos, layer) pairs.
 
@@ -262,10 +267,9 @@ def generate_directions_inlp(
     Y = np.array([1] * n_min + [0] * n_min, dtype=np.int32)
     train_idx, val_idx = _split_train_val(2 * n_min, val_frac=val_frac)
 
-    # INLP only needs the cached activations, not the model. Offload it to free GPU
-    # memory for the INLP tensors when activations were loaded from cache.
     model_original_device = next(model_base.model.parameters()).device
-    if from_cache and model_original_device.type == "cuda":
+    should_offload = offload_model and from_cache and model_original_device.type == "cuda"
+    if should_offload:
         print(f"INLP: offloading model to CPU to free GPU memory for INLP tensors")
         model_base.model.to("cpu")
         torch.cuda.empty_cache()
@@ -291,8 +295,6 @@ def generate_directions_inlp(
             src_pos = pos_idx - n_pos
             for layer_idx in tqdm(layers_to_train,
                                    desc=f"INLP generate (pos {src_pos})"):
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
                 X = torch.cat([
                     harmful_acts[:, pos_idx, layer_idx, :],
                     harmless_acts[:, pos_idx, layer_idx, :],
@@ -313,7 +315,7 @@ def generate_directions_inlp(
                     "classifier_dirs": classifier_dirs,
                 }
     finally:
-        if from_cache and model_original_device.type == "cuda":
+        if should_offload:
             print(f"INLP: restoring model to {model_original_device}")
             model_base.model.to(model_original_device)
 
