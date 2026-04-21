@@ -82,6 +82,16 @@ def parse_arguments():
                              'of (1.0, 2.0). Example: --reflection_alphas 2.0')
     parser.add_argument('--force_overwrite', action='store_true',
                         help='Force regeneration of completion files even if they already exist.')
+    parser.add_argument('--inlp_k_policy', type=str, default='none',
+                        choices=['none', 'fixed', 'acc99', 'acc95'],
+                        help='Restrict the INLP nullspace to a subset of its directions. '
+                             '"none" uses the full P (default). "fixed" restricts to '
+                             '--inlp_k_restrict directions. "acc99"/"acc95" restrict per '
+                             '(pos, layer) to the number of classifiers whose dev accuracy '
+                             'is >= 0.99 / 0.95. When policy != "none", only the reflection '
+                             'intervention is re-run (ablation/actadd are unaffected by k).')
+    parser.add_argument('--inlp_k_restrict', type=int, default=None,
+                        help='Integer k for --inlp_k_policy=fixed. Ignored for other policies.')
     return parser.parse_args()
 
 def save_run_params(cfg, extra_flags=None):
@@ -243,7 +253,7 @@ def select_ranked_direction_components(cfg, model_base, harmful_val, harmless_va
 
 def _make_inlp_component(row):
     """Convert an INLP scored row into a component dict."""
-    return {
+    comp = {
         'position': int(row['position']),
         'layer': int(row['layer']),
         'refusal_score': float(row['refusal_score']),
@@ -253,6 +263,11 @@ def _make_inlp_component(row):
         'direction': torch.from_numpy(row['first_dir']).float(),
         'P': row['P'],
     }
+    if 'k_used' in row:
+        comp['k_used'] = int(row['k_used'])
+    if 'k_accs_used' in row:
+        comp['k_accs_used'] = list(row['k_accs_used'])
+    return comp
 
 
 def select_ranked_inlp_components(cfg, model_base, harmful_val, harmless_val, actadd_multipliers, direction_norm):
@@ -265,6 +280,8 @@ def select_ranked_inlp_components(cfg, model_base, harmful_val, harmless_val, ac
         harmless_instructions=harmless_val,
         actadd_multipliers=actadd_multipliers,
         direction_norm=direction_norm,
+        k_policy=getattr(cfg, 'inlp_k_policy', 'none'),
+        k_fixed=getattr(cfg, 'inlp_k_restrict', None),
     )
 
     all_components = [_make_inlp_component(row) for row in all_ranked]
@@ -722,8 +739,11 @@ def _run_evaluation(cfg):
     if "llamaguard2" in cfg.jailbreak_eval_methodologies:
         lg2_classifier = LlamaGuard2Classifier(gpu_memory_utilization=cfg.vllm_gpu_memory_utilization)
 
-    # Load coefficient sweep from inference stage
-    coeffs_path = os.path.join(cfg.extraction_path(), 'actadd_coeffs.json')
+    # Load coefficient sweep from inference stage. Prefer the per-run copy
+    # (written by k-regime branches) over the shared extraction_path copy.
+    coeffs_path_local = os.path.join(cfg.artifact_path(), 'actadd_coeffs.json')
+    coeffs_path_shared = os.path.join(cfg.extraction_path(), 'actadd_coeffs.json')
+    coeffs_path = coeffs_path_local if os.path.exists(coeffs_path_local) else coeffs_path_shared
     with open(coeffs_path, 'r') as f:
         saved_params = json.load(f)
     actadd_coeffs = saved_params["coeffs"]
@@ -950,12 +970,183 @@ def _run_inference_from_existing(cfg, model_path):
         torch.cuda.empty_cache()
 
 
+def _run_reflection_k_from_existing(cfg, model_path):
+    """Reflection-only branch for a restricted INLP k-regime.
+
+    Reuses the shared extraction artifacts (inlp_results.pt, mean_diffs.pt,
+    ablation_components_filtered.pt, dataset_artifacts.json) and produces a
+    fresh run directory per k-regime. Skips ablation, nullspace (full-P), and
+    actadd interventions because they are unaffected by the k policy.
+    """
+    extraction_path = cfg.extraction_path()
+    artifact_path = cfg.artifact_path()
+    os.makedirs(artifact_path, exist_ok=True)
+
+    filtered_ablation_path = os.path.join(extraction_path, 'ablation_components_filtered.pt')
+    if not os.path.exists(filtered_ablation_path):
+        raise FileNotFoundError(
+            f"Missing {filtered_ablation_path}. Run full pipeline for k=None first "
+            "so the shared extraction/selection artifacts are present."
+        )
+
+    # Reload val split used for INLP scoring (harmless val needed for steering / KL).
+    _, _, harmful_val, harmless_val = load_dataset_artifacts(cfg)
+
+    # Best mean-diff direction norm — used to scale INLP actadd sweep inside the
+    # ranker. We only need the norm, so no re-ranking of mean-diff components.
+    filtered_ablation = torch.load(filtered_ablation_path, map_location='cpu', weights_only=False)
+    assert len(filtered_ablation) > 0, "No filtered mean-diff components available."
+    direction_norm = torch.norm(filtered_ablation[0]['direction']).item()
+
+    # Build model (needed for INLP scoring hooks and completions).
+    model_base = construct_model_base(cfg.model_path, device=cfg.device)
+
+    # Re-rank INLP pairs with the k-regime applied to each (pos, layer).
+    inlp_artifact_dir = os.path.join(extraction_path, 'generate_directions_inlp')
+    from pipeline.submodules.generate_directions_inlp import select_direction_inlp_ranked
+    actadd_multipliers = ACTADD_TARGET_MULTIPLIERS
+    all_inlp_raw, filtered_inlp_raw = select_direction_inlp_ranked(
+        artifact_dir=inlp_artifact_dir,
+        model_base=model_base,
+        harmful_instructions=harmful_val,
+        harmless_instructions=harmless_val,
+        actadd_multipliers=actadd_multipliers,
+        direction_norm=direction_norm,
+        k_policy=cfg.inlp_k_policy,
+        k_fixed=cfg.inlp_k_restrict,
+    )
+    all_inlp = [_make_inlp_component(row) for row in all_inlp_raw]
+    filtered_inlp = [_make_inlp_component(row) for row in filtered_inlp_raw]
+    assert len(filtered_inlp) > 0, "No INLP components selected under the k-regime. Adjust top_percentage / k_policy."
+
+    # Reuse the canonical_pool_size from the original full-pipeline run so that
+    # top_percentage resolves to the same shared_count as the baseline experiment.
+    base_metadata_path = os.path.join(extraction_path, 'selected_components_metadata.json')
+    if os.path.exists(base_metadata_path):
+        with open(base_metadata_path) as _f:
+            _base_meta = json.load(_f)
+        canonical_pool = _base_meta.get('canonical_pool_size', len(all_inlp))
+    else:
+        canonical_pool = len(all_inlp)
+    shared_count = _resolve_target_count(canonical_pool, cfg.top_percentage, just_one=cfg.just_one)
+    assert shared_count > 0, "No components selected. Adjust top_percentage or check filtering."
+    if len(all_inlp) < shared_count:
+        raise RuntimeError(
+            f"INLP pool under k-policy={cfg.inlp_k_policy} has {len(all_inlp)} entries, "
+            f"but requested top_percentage={cfg.top_percentage} needs {shared_count}."
+        )
+    selected_inlp_layers = all_inlp[:shared_count]
+
+    # Persist run metadata with the per-component k info.
+    with open(os.path.join(artifact_path, 'selected_components_metadata.json'), 'w') as f:
+        json.dump({
+            'top_percentage': cfg.top_percentage,
+            'just_one': cfg.just_one,
+            'inlp_k_policy': cfg.inlp_k_policy,
+            'inlp_k_restrict': cfg.inlp_k_restrict,
+            'inlp_pool_size': len(all_inlp),
+            'shared_count': shared_count,
+            'best_inlp': {
+                'position': filtered_inlp[0]['position'],
+                'layer': filtered_inlp[0]['layer'],
+                'k_used': filtered_inlp[0].get('k_used'),
+                'k_accs_used': filtered_inlp[0].get('k_accs_used'),
+            },
+            'selected_inlp': [
+                {
+                    'position': c['position'],
+                    'layer': c['layer'],
+                    'k_used': c.get('k_used'),
+                    'k_accs_used': c.get('k_accs_used'),
+                    'refusal_score': _safe_float(c.get('refusal_score', float('nan'))),
+                    'steering_score': _safe_float(c.get('steering_score', float('nan'))),
+                    'kl_div_score': _safe_float(c.get('kl_div_score', float('nan'))),
+                }
+                for c in selected_inlp_layers
+            ],
+        }, f, indent=4)
+
+    # Persist minimal actadd_coeffs.json INSIDE the per-run artifact dir so the
+    # evaluation pass iterates only the reflection labels for this regime and
+    # does not clobber the k=None coeffs file under extraction_path.
+    with open(os.path.join(artifact_path, 'actadd_coeffs.json'), 'w') as f:
+        json.dump({
+            "direction_norm": direction_norm,
+            "multipliers": list(actadd_multipliers),
+            "coeffs": [],
+            "intervention_mode": 'reflection',
+            "reflection_alphas": list(cfg.reflection_alphas),
+        }, f, indent=2)
+
+    print(
+        f"Reflection k-regime run: policy={cfg.inlp_k_policy}, "
+        f"k_restrict={cfg.inlp_k_restrict}, shared_count={shared_count}, "
+        f"inlp_pool={len(all_inlp)}, best=({filtered_inlp[0]['position']}, "
+        f"{filtered_inlp[0]['layer']}) k_used={filtered_inlp[0].get('k_used')}"
+    )
+
+    # Apply single optimal P to all selected components (same as inlp_single_optimal in main pipeline).
+    P_raw = filtered_inlp[0]['P']
+    if cfg.inlp_k_restrict is None:
+        P_optimal = P_raw
+    else:
+        _, P_optimal = get_directions_from_P(P_raw, k=cfg.inlp_k_restrict)
+    if cfg.inlp_single_optimal:
+        for comp in selected_inlp_layers:
+            comp['P'] = P_optimal
+
+    # --- Build reflection hooks and run completions / loss / benchmarks ------
+
+    baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
+
+    # Baseline completions (so this artifact dir is self-contained).
+    for dataset_name in cfg.evaluation_datasets:
+        generate_and_save_completions_for_dataset(
+            cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', dataset_name)
+        for alpha in cfg.reflection_alphas:
+            label = f'reflection_a{alpha:.2f}'
+            refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+                model_base, selected_inlp_layers, alpha=alpha)
+            generate_and_save_completions_for_dataset(
+                cfg, model_base, refl_pre, refl_hooks, label, dataset_name)
+
+    # Harmless completions.
+    harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
+    generate_and_save_completions_for_dataset(
+        cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
+    for alpha in cfg.reflection_alphas:
+        label = f'reflection_a{alpha:.2f}'
+        refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+            model_base, selected_inlp_layers, alpha=alpha)
+        generate_and_save_completions_for_dataset(
+            cfg, model_base, refl_pre, refl_hooks, label, 'harmless', dataset=harmless_test)
+
+    # Loss + benchmark evaluations for baseline and reflection only.
+    evaluate_loss_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
+    evaluate_benchmarks_for_datasets(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline')
+    for alpha in cfg.reflection_alphas:
+        label = f'reflection_a{alpha:.2f}'
+        refl_pre, refl_hooks = get_counterfactual_reflection_hooks(
+            model_base, selected_inlp_layers, alpha=alpha)
+        evaluate_loss_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
+        evaluate_benchmarks_for_datasets(cfg, model_base, refl_pre, refl_hooks, label)
+
+    # Release the model before LlamaGuard2 evaluation.
+    model_base.del_model()
+    del model_base
+    del all_inlp, filtered_inlp, selected_inlp_layers
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
                  resume_from_eval=False, skip_eval=False, use_existing=False,
                  top_percentage=1.0, extract_only=False, select_only=False,
                  infer_only=False, compare_rankings=False, just_one=False,
                  intervention_mode='both', reflection_alphas=None,
-                 force_overwrite=False):
+                 force_overwrite=False,
+                 inlp_k_policy='none', inlp_k_restrict=None):
     """Run the full pipeline."""
     model_alias = os.path.basename(model_path)
     cfg = Config(model_alias=model_alias, model_path=model_path, device=device,
@@ -964,7 +1155,9 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
                  compare_rankings=compare_rankings,
                  intervention_mode=intervention_mode,
                  reflection_alphas=tuple(reflection_alphas) if reflection_alphas else (1.0, 2.0),
-                 force_overwrite=force_overwrite)
+                 force_overwrite=force_overwrite,
+                 inlp_k_policy=inlp_k_policy,
+                 inlp_k_restrict=inlp_k_restrict)
 
     save_run_params(cfg, extra_flags={
         'resume_from_eval': resume_from_eval,
@@ -990,6 +1183,17 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
         if resume_from_eval or use_existing:
             raise ValueError("--select_only is incompatible with --resume_from_eval and --use_existing.")
         _run_selection(cfg, model_path)
+        return
+
+    # k-regime branch: reflection-only, reuses shared extraction artifacts.
+    if cfg.inlp_k_policy and cfg.inlp_k_policy != 'none':
+        if cfg.intervention_mode == 'actadd':
+            raise ValueError("--inlp_k_policy has no effect on actadd. Use "
+                             "--intervention_mode reflection (or both) with a k-policy.")
+        if not resume_from_eval:
+            _run_reflection_k_from_existing(cfg, model_path)
+        if not skip_eval:
+            _run_evaluation(cfg)
         return
 
     if infer_only:
@@ -1026,4 +1230,6 @@ if __name__ == "__main__":
                  just_one=args.just_one,
                  intervention_mode=args.intervention_mode,
                  reflection_alphas=args.reflection_alphas,
-                 force_overwrite=args.force_overwrite)
+                 force_overwrite=args.force_overwrite,
+                 inlp_k_policy=args.inlp_k_policy,
+                 inlp_k_restrict=args.inlp_k_restrict)

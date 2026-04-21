@@ -27,6 +27,12 @@ class Config:
     # Single optimal INLP projection
     inlp_single_optimal: bool = True
     inlp_k_restrict: Optional[int] = None
+    # k-regime policy for the INLP nullspace:
+    #   'none'  — use the full P found by INLP (current behaviour).
+    #   'fixed' — restrict to the top ``inlp_k_restrict`` directions from P.
+    #   'acc99' — per-(pos, layer) k = # classifiers with dev acc >= 0.99.
+    #   'acc95' — per-(pos, layer) k = # classifiers with dev acc >= 0.95.
+    inlp_k_policy: str = 'none'
     # Intervention mode
     intervention_mode: str = 'both'       # 'actadd', 'reflection', or 'both'
     reflection_alphas: Tuple[float, ...] = (1.0, 2.0)
@@ -43,9 +49,22 @@ class Config:
 
     def artifact_path(self) -> str:
         """Path for per-run artifacts (selected components, completions, loss evals).
-        Scoped by top_percentage (or just_one) so different runs are kept distinct."""
+        Scoped by top_percentage (or just_one) and INLP k-regime so different runs
+        are kept distinct."""
         if self.just_one:
             subdir = "top_just1"
         else:
             subdir = f"top{self.top_percentage:g}"
+        subdir += self._k_suffix()
         return os.path.join(os.path.dirname(os.path.realpath(__file__)), "runs", self.model_alias, subdir)
+
+    def _k_suffix(self) -> str:
+        policy = (self.inlp_k_policy or 'none').lower()
+        if policy == 'none':
+            return ''
+        if policy == 'fixed':
+            k = self.inlp_k_restrict if self.inlp_k_restrict is not None else 'na'
+            return f"_k{k}"
+        if policy in ('acc99', 'acc95'):
+            return f"_{policy}"
+        raise ValueError(f"Unknown inlp_k_policy: {self.inlp_k_policy!r}")

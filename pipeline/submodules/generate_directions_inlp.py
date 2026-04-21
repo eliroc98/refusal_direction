@@ -362,6 +362,40 @@ def compute_inlp_nullspace_projection(
 
 # ─── Direction selection via nullspace projection effect ──────────────────────
 
+def resolve_k_for_policy(
+    policy: str,
+    k_fixed: Optional[int],
+    accuracies: List[float],
+) -> Optional[int]:
+    """Map ``(policy, k_fixed, accuracies)`` to an integer k (or None for full P).
+
+    Returns ``None`` when ``policy == 'none'`` (caller keeps the original P).
+    Returns a non-negative integer otherwise; callers should treat ``0`` as
+    "no valid projection for this (pos, layer)" and skip it.
+    """
+    p = (policy or 'none').lower()
+    if p == 'none':
+        return None
+    if p == 'fixed':
+        if k_fixed is None:
+            raise ValueError("inlp_k_policy='fixed' requires inlp_k_restrict to be set")
+        return int(k_fixed)
+    if p == 'acc99':
+        return sum(1 for a in accuracies if a >= 0.99)
+    if p == 'acc95':
+        return sum(1 for a in accuracies if a >= 0.95)
+    raise ValueError(f"Unknown inlp_k_policy: {policy!r}")
+
+
+def _k_suffix_for_policy(policy: str, k_fixed: Optional[int]) -> str:
+    p = (policy or 'none').lower()
+    if p == 'none':
+        return ''
+    if p == 'fixed':
+        return f"_k{k_fixed}" if k_fixed is not None else "_kna"
+    return f"_{p}"
+
+
 def select_direction_inlp_ranked(
     artifact_dir: str,
     model_base: ModelBase,
@@ -372,6 +406,8 @@ def select_direction_inlp_ranked(
     kl_threshold: Optional[float] = 0.1,
     prune_layer_percentage: float = 0.20,
     batch_size: int = 32,
+    k_policy: str = 'none',
+    k_fixed: Optional[int] = None,
 ) -> List[dict]:
     """Select the best (pos, layer) for INLP using actadd-median refusal scoring.
 
@@ -465,12 +501,26 @@ def select_direction_inlp_ranked(
                 continue
 
             entry = inlp_params[key]
-            P = entry["P"]
+            P_full = entry["P"]
             first_dir = entry["first_dir"]
             accuracies = entry["accuracies"]
 
             if first_dir is None or len(accuracies) == 0:
                 continue
+
+            # Resolve k for the current policy and restrict P accordingly.
+            k_eff = resolve_k_for_policy(k_policy, k_fixed, accuracies)
+            if k_eff is None:
+                P = P_full
+            else:
+                if k_eff <= 0:
+                    # No classifier passes the policy threshold for this pair —
+                    # projection would be a no-op, so skip.
+                    print(f"Skipping (pos {src_pos}, layer {layer_idx}): k_eff={k_eff} ≤ 0 (no classifiers pass the policy threshold)")
+                    continue
+                k_eff = min(k_eff, len(accuracies))
+                _, P = get_directions_from_P(P_full, k=k_eff)
+            print(f"accuracies={accuracies}, k_eff={k_eff}")
 
             # Refusal score: nullspace projection P on harmful
             nullspace_hooks = [(model_base.model_block_modules[layer_idx],
@@ -523,6 +573,7 @@ def select_direction_inlp_ranked(
                     baseline_harmless_logits, intervention_logits, mask=None
                 ).mean().item()
 
+            k_used = len(accuracies) if k_eff is None else int(k_eff)
             row = {
                 'position': src_pos,
                 'layer': layer_idx,
@@ -534,6 +585,8 @@ def select_direction_inlp_ranked(
                 'sorting_score': -refusal_score,
                 'first_dir': first_dir.squeeze().copy(),
                 'P': P.copy(),
+                'k_used': k_used,
+                'k_accs_used': [float(a) for a in accuracies[:k_used]],
             }
 
             all_scores.append(row)
@@ -555,6 +608,7 @@ def select_direction_inlp_ranked(
             if not discard_direction:
                 filtered_scores.append(row)
 
+    k_suffix = _k_suffix_for_policy(k_policy, k_fixed)
     token_labels = model_base.tokenizer.batch_decode(model_base.eoi_toks)
     plot_refusal_scores(
         refusal_scores=plot_refusal_scores_tensor,
@@ -562,7 +616,7 @@ def select_direction_inlp_ranked(
         token_labels=token_labels,
         title='INLP: nullspace projection refusal on harmful instructions',
         artifact_dir=artifact_dir,
-        artifact_name='inlp_refusal_scores',
+        artifact_name=f'inlp_refusal_scores{k_suffix}',
     )
     plot_refusal_scores(
         refusal_scores=plot_steering_scores_tensor,
@@ -570,7 +624,7 @@ def select_direction_inlp_ranked(
         token_labels=token_labels,
         title=f'INLP: steering median on harmless instructions (multipliers={actadd_multipliers})',
         artifact_dir=artifact_dir,
-        artifact_name='inlp_steering_median_scores',
+        artifact_name=f'inlp_steering_median_scores{k_suffix}',
     )
     plot_refusal_scores(
         refusal_scores=plot_kl_div_scores_tensor,
@@ -578,7 +632,7 @@ def select_direction_inlp_ranked(
         token_labels=token_labels,
         title='INLP: KL divergence (nullspace projection on harmless)',
         artifact_dir=artifact_dir,
-        artifact_name='inlp_kl_div_scores',
+        artifact_name=f'inlp_kl_div_scores{k_suffix}',
     )
     all_scores.sort(key=lambda x: (-x['first_classifier_acc'], -x['sorting_score'], x['position'], x['layer']))
     if len(filtered_scores) == 0:
@@ -616,11 +670,13 @@ def select_direction_inlp_ranked(
             'n_classifiers': x['n_classifiers'],
             'first_classifier_acc': x['first_classifier_acc'],
             'sorting_score': x['sorting_score'],
+            'k_used': x.get('k_used'),
+            'k_accs_used': x.get('k_accs_used'),
         }
 
-    with open(os.path.join(artifact_dir, "inlp_selection_scores.json"), "w") as f:
+    with open(os.path.join(artifact_dir, f"inlp_selection_scores{k_suffix}.json"), "w") as f:
         _json.dump([_json_row(x) for x in all_scores], f, indent=4)
-    with open(os.path.join(artifact_dir, "inlp_selection_scores_filtered.json"), "w") as f:
+    with open(os.path.join(artifact_dir, f"inlp_selection_scores_filtered{k_suffix}.json"), "w") as f:
         _json.dump([_json_row(x) for x in filtered_scores], f, indent=4)
 
     best = filtered_scores[0]
@@ -633,6 +689,8 @@ def select_direction_inlp_ranked(
         f"harmless steering={best['steering_score']:.4f}, "
         f"kl={best['kl_div_score']:.4f}), "
         f"first_classifier_acc={best['first_classifier_acc']:.4f}, "
+        f"k_used={best.get('k_used')}, "
+        f"k_policy={k_policy}, k_fixed={k_fixed}"
     )
     print(f"INLP pool sizes: all={len(all_scores)}, filtered={len(filtered_scores)}")
 
