@@ -709,15 +709,23 @@ def select_direction_inlp_ranked(
             print("WARNING: No valid INLP direction found at any (pos, layer). INLP interventions will be skipped.")
             return all_scores, []
 
-        # Fallback: select the best available INLP direction from the unfiltered pool
-        # using composite ranking: lowest refusal score, lowest KL, highest steering.
-        print("WARNING: No INLP direction passed filtering. Falling back to best unfiltered direction.")
+        # Fallback: select the best available INLP direction from the unfiltered,
+        # non-pruned pool using composite ranking.
+        print("WARNING: No INLP direction passed filtering. Falling back to best unfiltered, non-pruned direction.")
         print(f"  • kl_threshold={kl_threshold}: {sum(1 for x in all_scores if x['kl_div_score'] > kl_threshold)} directions exceed KL limit")
         print(f"  • prune_layer_percentage={prune_layer_percentage}: {sum(1 for x in all_scores if x['layer'] >= int(n_layers * (1.0 - prune_layer_percentage)))} directions in pruned layers")
 
+        fallback_pool = [
+            x for x in all_scores
+            if prune_layer_percentage is None or x['layer'] < int(n_layers * (1.0 - prune_layer_percentage))
+        ]
+        if len(fallback_pool) == 0:
+            print("WARNING: No unfiltered INLP direction remains after applying the layer-pruning fallback constraint. INLP interventions will be skipped.")
+            return all_scores, []
+
         # Rank by: lowest refusal_score, then lowest kl_div_score, then best accuracy,then highest steering_score
         fallback = sorted(
-            all_scores,
+            fallback_pool,
             key=lambda x: (-x['first_classifier_acc'], x['refusal_score'], x['kl_div_score'], -x['steering_score']),
         )
         filtered_scores.append(fallback[0])
