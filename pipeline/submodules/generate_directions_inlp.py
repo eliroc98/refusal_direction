@@ -57,7 +57,7 @@ def _run_inlp(
     device: torch.device,
     n_classifiers: int = 100,
     min_accuracy: float = 0.55,
-) -> Tuple[np.ndarray, Optional[np.ndarray], List[float]]:
+) -> Tuple[np.ndarray, Optional[np.ndarray], List[float], np.ndarray]:
     """Run INLP using PyTorch logistic regression on GPU.
 
     Returns
@@ -69,6 +69,11 @@ def _run_inlp(
         or None if no classifier exceeded min_accuracy.
     accuracies : list[float]
         Dev-set accuracy at each INLP iteration.
+    classifier_dirs : np.ndarray, shape (n_classifiers, d)
+        Unit-normalized classifier direction at each iteration, oriented so that
+        harmful activations score higher than harmless. These are the individual
+        directions projected out across iterations; any subset S gives a valid
+        projection P_S = I - proj(span(classifier_dirs[S])).
     """
     d = X_train.shape[-1]
     dtype = torch.float32
@@ -76,16 +81,17 @@ def _run_inlp(
     Xtr = torch.from_numpy(X_train).to(device=device, dtype=dtype)
     Ytr = torch.from_numpy(Y_train).to(device=device, dtype=dtype)
     Xdv = torch.from_numpy(X_dev).to(device=device, dtype=dtype)
-    Ydv = torch.from_numpy(Y_dev)  # CPU for accuracy check
+    Ydv = torch.from_numpy(Y_dev)
 
     rowspace_projs: List[torch.Tensor] = []
     first_dir: Optional[np.ndarray] = None
     accuracies: List[float] = []
+    classifier_dirs: List[np.ndarray] = []
 
     Xtr_proj = Xtr.clone()
     Xdv_proj = Xdv.clone()
     P_current = torch.eye(d, device=device, dtype=dtype)
-    lam = 1.0 / (2 * 0.1 * len(Ytr))  # L2 reg equivalent to sklearn C=0.1
+    lam = 1.0 / (2 * 0.1 * len(Ytr))
 
     for _ in range(n_classifiers):
         W = torch.zeros(d, device=device, dtype=dtype, requires_grad=True)
@@ -107,15 +113,19 @@ def _run_inlp(
 
         Wmat = W.detach().unsqueeze(0)  # (1, d)
 
+        # Orient so harmful > harmless and unit-normalize.
+        scores = Xtr @ Wmat.T
+        if scores[Ytr == 1].mean() < scores[Ytr == 0].mean():
+            Wmat = -Wmat
+        norm = Wmat.norm()
+        Wunit = Wmat / (norm + 1e-12)
+        classifier_dirs.append(Wunit.squeeze(0).cpu().numpy())
+
         if first_dir is None:
-            scores = Xtr @ Wmat.T
-            if scores[Ytr == 1].mean() < scores[Ytr == 0].mean():
-                Wmat = -Wmat
-            norm = Wmat.norm()
-            first_dir = (Wmat / norm).cpu().numpy()
+            first_dir = Wunit.cpu().numpy()
 
         accuracies.append(acc)
-        rowspace_projs.append(_get_rowspace_projection(Wmat))
+        rowspace_projs.append(_get_rowspace_projection(Wunit))
 
         Q = torch.stack(rowspace_projs).sum(dim=0)
         svdvals = torch.linalg.svdvals(Q)
@@ -132,7 +142,8 @@ def _run_inlp(
     if accuracies:
         print(f"INLP: {len(accuracies)} classifiers, accuracies = {[f'{a:.3f}' for a in accuracies]}")
 
-    return P_current.cpu().numpy(), first_dir, accuracies
+    classifier_dirs_arr = np.stack(classifier_dirs, axis=0) if classifier_dirs else np.zeros((0, d), dtype=np.float32)
+    return P_current.cpu().numpy(), first_dir, accuracies, classifier_dirs_arr
 
 
 # ─── Activation extraction ────────────────────────────────────────────────────
@@ -204,23 +215,30 @@ def generate_directions_inlp(
 
     positions = list(range(-len(model_base.eoi_toks), 0))
 
-    print("INLP: extracting harmful activations …")
-    harmful_acts = get_all_activations(
-        model_base.model, harmful_instructions,
-        model_base.tokenize_instructions_fn, model_base.model_block_modules,
-        batch_size=batch_size, positions=positions,
-    )   # (n_harmful, n_pos, n_layers, d_model)
+    harmful_cache = os.path.join(artifact_dir, "harmful_activations.pt")
+    harmless_cache = os.path.join(artifact_dir, "harmless_activations.pt")
 
-    print("INLP: extracting harmless activations …")
-    harmless_acts = get_all_activations(
-        model_base.model, harmless_instructions,
-        model_base.tokenize_instructions_fn, model_base.model_block_modules,
-        batch_size=batch_size, positions=positions,
-    )   # (n_harmless, n_pos, n_layers, d_model)
+    if os.path.exists(harmful_cache) and os.path.exists(harmless_cache):
+        print(f"INLP: loading cached activations from {artifact_dir}")
+        harmful_acts = torch.load(harmful_cache, map_location="cpu")
+        harmless_acts = torch.load(harmless_cache, map_location="cpu")
+    else:
+        print("INLP: extracting harmful activations …")
+        harmful_acts = get_all_activations(
+            model_base.model, harmful_instructions,
+            model_base.tokenize_instructions_fn, model_base.model_block_modules,
+            batch_size=batch_size, positions=positions,
+        )   # (n_harmful, n_pos, n_layers, d_model)
 
-    # Save raw activations (backward compat)
-    torch.save(harmful_acts, os.path.join(artifact_dir, "harmful_activations.pt"))
-    torch.save(harmless_acts, os.path.join(artifact_dir, "harmless_activations.pt"))
+        print("INLP: extracting harmless activations …")
+        harmless_acts = get_all_activations(
+            model_base.model, harmless_instructions,
+            model_base.tokenize_instructions_fn, model_base.model_block_modules,
+            batch_size=batch_size, positions=positions,
+        )   # (n_harmless, n_pos, n_layers, d_model)
+
+        torch.save(harmful_acts, harmful_cache)
+        torch.save(harmless_acts, harmless_cache)
 
     # Run INLP for every (pos, layer) pair
     n_pos = len(positions)
@@ -244,7 +262,7 @@ def generate_directions_inlp(
                 harmless_acts[:, pos_idx, layer_idx, :],
             ], dim=0).numpy()
 
-            P, first_dir, accuracies = _run_inlp(
+            P, first_dir, accuracies, classifier_dirs = _run_inlp(
                 X[train_idx], Y[train_idx],
                 X[val_idx], Y[val_idx],
                 device=device,
@@ -256,6 +274,7 @@ def generate_directions_inlp(
                 "P": P,
                 "first_dir": first_dir.squeeze() if first_dir is not None else None,
                 "accuracies": accuracies,
+                "classifier_dirs": classifier_dirs,
             }
 
     results = {
@@ -362,16 +381,19 @@ def compute_inlp_nullspace_projection(
 
 # ─── Direction selection via nullspace projection effect ──────────────────────
 
-def resolve_k_for_policy(
+def resolve_indices_for_policy(
     policy: str,
     k_fixed: Optional[int],
     accuracies: List[float],
-) -> Optional[int]:
-    """Map ``(policy, k_fixed, accuracies)`` to an integer k (or None for full P).
+) -> Optional[List[int]]:
+    """Map ``(policy, k_fixed, accuracies)`` to the classifier indices to keep.
 
-    Returns ``None`` when ``policy == 'none'`` (caller keeps the original P).
-    Returns a non-negative integer otherwise; callers should treat ``0`` as
-    "no valid projection for this (pos, layer)" and skip it.
+    Returns ``None`` when ``policy == 'none'`` (caller keeps the full P).
+    Returns a list of classifier indices otherwise. Note that accuracies are
+    NOT monotone in INLP — a policy like ``acc80`` yields the (possibly
+    non-contiguous) set of indices whose dev accuracy meets the threshold.
+    Callers should treat an empty list as "no valid projection for this
+    (pos, layer)" and skip it.
     """
     p = (policy or 'none').lower()
     if p == 'none':
@@ -379,12 +401,48 @@ def resolve_k_for_policy(
     if p == 'fixed':
         if k_fixed is None:
             raise ValueError("inlp_k_policy='fixed' requires inlp_k_restrict to be set")
-        return int(k_fixed)
-    if p == 'acc99':
-        return sum(1 for a in accuracies if a >= 0.99)
-    if p == 'acc95':
-        return sum(1 for a in accuracies if a >= 0.95)
+        k = int(k_fixed)
+        return list(range(min(k, len(accuracies))))
+    if p == 'acc90':
+        return [i for i, a in enumerate(accuracies) if a >= 0.90]
+    if p == 'acc80':
+        return [i for i, a in enumerate(accuracies) if a >= 0.80]
     raise ValueError(f"Unknown inlp_k_policy: {policy!r}")
+
+
+def build_P_from_indices(
+    classifier_dirs: np.ndarray,
+    indices: List[int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build a nullspace projection P removing the subspace spanned by the
+    selected classifier directions.
+
+    Parameters
+    ----------
+    classifier_dirs : np.ndarray, shape (n_classifiers, d)
+        Unit-normalized INLP classifier directions (one per iteration).
+    indices : list[int]
+        Subset of classifier indices to project out.
+
+    Returns
+    -------
+    selected : np.ndarray, shape (len(indices), d)
+        The selected classifier directions (copy).
+    P : np.ndarray, shape (d, d), dtype float64
+        Projection matrix P = I - V_orth^T @ V_orth where V_orth is an
+        orthonormal basis of span(selected).  When ``indices`` is empty,
+        P is the identity.
+    """
+    d = classifier_dirs.shape[-1]
+    if len(indices) == 0:
+        return np.zeros((0, d), dtype=np.float64), np.eye(d, dtype=np.float64)
+    selected = classifier_dirs[np.asarray(indices, dtype=np.int64)].astype(np.float64)
+    # Orthonormal basis of span(selected); V_orth rows are orthonormal.
+    _, s, Vh = np.linalg.svd(selected, full_matrices=False)
+    rank = int((s > 1e-7).sum())
+    V_orth = Vh[:rank]
+    P = np.eye(d, dtype=np.float64) - V_orth.T @ V_orth
+    return selected, P
 
 
 def _k_suffix_for_policy(policy: str, k_fixed: Optional[int]) -> str:
@@ -504,23 +562,28 @@ def select_direction_inlp_ranked(
             P_full = entry["P"]
             first_dir = entry["first_dir"]
             accuracies = entry["accuracies"]
+            classifier_dirs = entry.get("classifier_dirs")
 
             if first_dir is None or len(accuracies) == 0:
                 continue
 
-            # Resolve k for the current policy and restrict P accordingly.
-            k_eff = resolve_k_for_policy(k_policy, k_fixed, accuracies)
-            if k_eff is None:
+            # Resolve which classifier indices to project out for this policy.
+            # Note: accuracies are not monotone, so acc-thresholded policies
+            # may select a non-contiguous subset (e.g. {0, 1, 3, 4}).
+            indices = resolve_indices_for_policy(k_policy, k_fixed, accuracies)
+            if indices is None:
                 P = P_full
+                selected_accs = list(accuracies)
             else:
-                if k_eff <= 0:
-                    # No classifier passes the policy threshold for this pair —
-                    # projection would be a no-op, so skip.
-                    print(f"Skipping (pos {src_pos}, layer {layer_idx}): k_eff={k_eff} ≤ 0 (no classifiers pass the policy threshold)")
+                if len(indices) == 0:
+                    print(f"Skipping (pos {src_pos}, layer {layer_idx}): no classifiers pass the policy threshold (accuracies={accuracies})")
                     continue
-                k_eff = min(k_eff, len(accuracies))
-                _, P = get_directions_from_P(P_full, k=k_eff)
-            print(f"accuracies={accuracies}, k_eff={k_eff}")
+                if classifier_dirs is None or classifier_dirs.shape[0] == 0:
+                    print(f"Skipping (pos {src_pos}, layer {layer_idx}): classifier_dirs unavailable; re-run generate_directions_inlp")
+                    continue
+                _, P = build_P_from_indices(classifier_dirs, indices)
+                selected_accs = [float(accuracies[i]) for i in indices]
+            print(f"accuracies={accuracies}, selected_indices={indices}")
 
             # Refusal score: nullspace projection P on harmful
             nullspace_hooks = [(model_base.model_block_modules[layer_idx],
@@ -573,7 +636,12 @@ def select_direction_inlp_ranked(
                     baseline_harmless_logits, intervention_logits, mask=None
                 ).mean().item()
 
-            k_used = len(accuracies) if k_eff is None else int(k_eff)
+            if indices is None:
+                k_used = len(accuracies)
+                indices_used = list(range(len(accuracies)))
+            else:
+                k_used = len(indices)
+                indices_used = list(indices)
             row = {
                 'position': src_pos,
                 'layer': layer_idx,
@@ -586,7 +654,8 @@ def select_direction_inlp_ranked(
                 'first_dir': first_dir.squeeze().copy(),
                 'P': P.copy(),
                 'k_used': k_used,
-                'k_accs_used': [float(a) for a in accuracies[:k_used]],
+                'indices_used': indices_used,
+                'k_accs_used': selected_accs,
             }
 
             all_scores.append(row)
