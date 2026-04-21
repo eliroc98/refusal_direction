@@ -31,7 +31,7 @@ from pipeline.model_utils.model_base import ModelBase
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
-def _split_train_val(n_samples: int, val_frac: float = 0.2, seed: int = 42):
+def _split_train_val(n_samples: int, val_frac: float = 0.3, seed: int = 42):
     """Split indices into train/val sets (deterministic)."""
     n_val = max(4, int(n_samples * val_frac))
     rng = np.random.default_rng(seed=seed)
@@ -83,7 +83,6 @@ def _run_inlp(
     Xdv = torch.from_numpy(X_dev).to(device=device, dtype=dtype)
     Ydv = torch.from_numpy(Y_dev)
 
-    rowspace_projs: List[torch.Tensor] = []
     first_dir: Optional[np.ndarray] = None
     accuracies: List[float] = []
     classifier_dirs: List[np.ndarray] = []
@@ -91,6 +90,8 @@ def _run_inlp(
     Xtr_proj = Xtr.clone()
     Xdv_proj = Xdv.clone()
     P_current = torch.eye(d, device=device, dtype=dtype)
+    # Running sum of rowspace projections — avoids O(k²) memory from re-stacking.
+    Q = torch.zeros(d, d, device=device, dtype=dtype)
     lam = 1.0 / (2 * 0.1 * len(Ytr))
 
     for _ in range(n_classifiers):
@@ -125,15 +126,17 @@ def _run_inlp(
             first_dir = Wunit.cpu().numpy()
 
         accuracies.append(acc)
-        rowspace_projs.append(_get_rowspace_projection(Wunit))
+        Q = Q + _get_rowspace_projection(Wunit)
 
-        Q = torch.stack(rowspace_projs).sum(dim=0)
         svdvals = torch.linalg.svdvals(Q)
         _, _, Vh = torch.linalg.svd(Q, full_matrices=False)
         rank = int((svdvals > 1e-7).sum())
         P_current = torch.eye(d, device=device, dtype=dtype) - Vh[:rank].T @ Vh[:rank]
 
         if acc < min_accuracy:
+            break
+
+        if len(accuracies) >= 3 and accuracies[-1] == accuracies[-2] == accuracies[-3]:
             break
 
         Xtr_proj = (P_current @ Xtr.T).T
@@ -202,7 +205,8 @@ def generate_directions_inlp(
     batch_size: int = 32,
     n_classifiers: int = 100,
     min_accuracy: float = 0.55,
-    val_frac: float = 0.2,
+    val_frac: float = 0.3,
+    prune_layer_percentage: Optional[float] = 0.20,
 ) -> None:
     """Extract activations and compute INLP for all (pos, layer) pairs.
 
@@ -210,6 +214,12 @@ def generate_directions_inlp(
       - ``harmful_activations.pt`` / ``harmless_activations.pt`` (raw activations)
       - ``inlp_results.pt`` — per-(pos, layer) nullspace projection P,
         first classifier direction, and accuracies.
+
+    ``prune_layer_percentage`` skips INLP training for the last fraction of
+    layers, matching the filter applied by downstream selection. Pass ``None``
+    to train every layer. The activation cache (harmful/harmless .pt) is
+    always written in full, so changing this value on a later run re-uses
+    cached activations and only re-trains INLP.
     """
     os.makedirs(artifact_dir, exist_ok=True)
 
@@ -218,7 +228,9 @@ def generate_directions_inlp(
     harmful_cache = os.path.join(artifact_dir, "harmful_activations.pt")
     harmless_cache = os.path.join(artifact_dir, "harmless_activations.pt")
 
-    if os.path.exists(harmful_cache) and os.path.exists(harmless_cache):
+    from_cache = os.path.exists(harmful_cache) and os.path.exists(harmless_cache)
+
+    if from_cache:
         print(f"INLP: loading cached activations from {artifact_dir}")
         harmful_acts = torch.load(harmful_cache, map_location="cpu")
         harmless_acts = torch.load(harmless_cache, map_location="cpu")
@@ -250,32 +262,60 @@ def generate_directions_inlp(
     Y = np.array([1] * n_min + [0] * n_min, dtype=np.int32)
     train_idx, val_idx = _split_train_val(2 * n_min, val_frac=val_frac)
 
-    device = next(model_base.model.parameters()).device
+    # INLP only needs the cached activations, not the model. Offload it to free GPU
+    # memory for the INLP tensors when activations were loaded from cache.
+    model_original_device = next(model_base.model.parameters()).device
+    if from_cache and model_original_device.type == "cuda":
+        print(f"INLP: offloading model to CPU to free GPU memory for INLP tensors")
+        model_base.model.to("cpu")
+        torch.cuda.empty_cache()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     inlp_params = {}
 
-    for pos_idx in range(n_pos):
-        src_pos = pos_idx - n_pos
-        for layer_idx in tqdm(range(n_layers),
-                               desc=f"INLP generate (pos {src_pos})"):
-            X = torch.cat([
-                harmful_acts[:, pos_idx, layer_idx, :],
-                harmless_acts[:, pos_idx, layer_idx, :],
-            ], dim=0).numpy()
-
-            P, first_dir, accuracies, classifier_dirs = _run_inlp(
-                X[train_idx], Y[train_idx],
-                X[val_idx], Y[val_idx],
-                device=device,
-                n_classifiers=n_classifiers,
-                min_accuracy=min_accuracy,
+    if prune_layer_percentage is None:
+        layers_to_train = list(range(n_layers))
+    else:
+        cutoff = int(n_layers * (1.0 - prune_layer_percentage))
+        layers_to_train = list(range(cutoff))
+        n_pruned = n_layers - cutoff
+        if n_pruned > 0:
+            print(
+                f"INLP: pruning last {n_pruned}/{n_layers} layers "
+                f"(prune_layer_percentage={prune_layer_percentage}); "
+                f"training layers 0..{cutoff - 1}"
             )
 
-            inlp_params[f"({pos_idx}, {layer_idx})"] = {
-                "P": P,
-                "first_dir": first_dir.squeeze() if first_dir is not None else None,
-                "accuracies": accuracies,
-                "classifier_dirs": classifier_dirs,
-            }
+    try:
+        for pos_idx in range(n_pos):
+            src_pos = pos_idx - n_pos
+            for layer_idx in tqdm(layers_to_train,
+                                   desc=f"INLP generate (pos {src_pos})"):
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                X = torch.cat([
+                    harmful_acts[:, pos_idx, layer_idx, :],
+                    harmless_acts[:, pos_idx, layer_idx, :],
+                ], dim=0).numpy()
+
+                P, first_dir, accuracies, classifier_dirs = _run_inlp(
+                    X[train_idx], Y[train_idx],
+                    X[val_idx], Y[val_idx],
+                    device=device,
+                    n_classifiers=n_classifiers,
+                    min_accuracy=min_accuracy,
+                )
+
+                inlp_params[f"({pos_idx}, {layer_idx})"] = {
+                    "P": P,
+                    "first_dir": first_dir.squeeze() if first_dir is not None else None,
+                    "accuracies": accuracies,
+                    "classifier_dirs": classifier_dirs,
+                }
+    finally:
+        if from_cache and model_original_device.type == "cuda":
+            print(f"INLP: restoring model to {model_original_device}")
+            model_base.model.to(model_original_device)
 
     results = {
         "inlp_params": inlp_params,
@@ -284,6 +324,7 @@ def generate_directions_inlp(
         "n_classifiers": n_classifiers,
         "min_accuracy": min_accuracy,
         "val_frac": val_frac,
+        "prune_layer_percentage": prune_layer_percentage,
     }
     torch.save(results, os.path.join(artifact_dir, "inlp_results.pt"))
     print(f"INLP: saved results for {len(inlp_params)} (pos, layer) pairs to {artifact_dir}/inlp_results.pt")
