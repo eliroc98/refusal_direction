@@ -31,7 +31,7 @@ from pipeline.model_utils.model_base import ModelBase
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
-def _split_train_val(n_samples: int, val_frac: float = 0.3, seed: int = 42):
+def _split_train_val(n_samples: int, val_frac: float = 0.2, seed: int = 42):
     """Split indices into train/val sets (deterministic)."""
     n_val = max(4, int(n_samples * val_frac))
     rng = np.random.default_rng(seed=seed)
@@ -209,7 +209,7 @@ def generate_directions_inlp(
     batch_size: int = 32,
     n_classifiers: int = 100,
     min_accuracy: float = 0.55,
-    val_frac: float = 0.3,
+    val_frac: float = 0.2,
     prune_layer_percentage: Optional[float] = 0.20,
     offload_model: bool = False,
 ) -> None:
