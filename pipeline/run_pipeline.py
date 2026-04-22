@@ -1,4 +1,6 @@
 import gc
+import glob
+import shutil
 import torch
 import random
 import json
@@ -279,12 +281,67 @@ def save_run_params(dir_path, cfg, extra_flags=None):
 #  Completion + eval helpers (dir-scoped so we can write to mode dir or actadd dir)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _try_link_from_siblings(target_path, candidate_sources):
+    """Hardlink target_path from the first existing candidate source.
+    Returns True if a link/copy was made (skip recompute), False otherwise."""
+    for src in candidate_sources:
+        if src == target_path or not os.path.exists(src):
+            continue
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        try:
+            os.link(src, target_path)
+        except OSError:
+            shutil.copyfile(src, target_path)
+        print(f"Reused {target_path} from sibling {src}")
+        return True
+    return False
+
+
+def _best_inlp_matches(src_cell_dir, cur_cell_dir):
+    """For inlp_actadd reuse: confirm two cells share the best_inlp (pos, layer)."""
+    src_meta = os.path.join(src_cell_dir, 'selected_components_metadata.json')
+    cur_meta = os.path.join(cur_cell_dir, 'selected_components_metadata.json')
+    if not (os.path.exists(src_meta) and os.path.exists(cur_meta)):
+        return False
+    with open(src_meta) as f:
+        s = json.load(f).get('best_inlp', {})
+    with open(cur_meta) as f:
+        c = json.load(f).get('best_inlp', {})
+    return (s.get('position') == c.get('position')
+            and s.get('layer') == c.get('layer'))
+
+
+def _sibling_sources(cfg, scope, subdir, fname):
+    """Resolve sibling artifact paths under runs/<alias>/.
+
+    scope ∈ {'any', 'same_mode', 'actadd', 'inlp_actadd'}
+    subdir ∈ {'completions', 'loss_evals', 'benchmark_evals'}
+    """
+    root = cfg.extraction_path()
+    if scope == 'any':
+        glob_pat = os.path.join(root, '*', subdir, fname)
+    elif scope == 'same_mode':
+        glob_pat = os.path.join(root, f"{cfg.component_mode}__*", subdir, fname)
+    elif scope in ('actadd', 'inlp_actadd'):
+        glob_pat = os.path.join(root, 'actadd__*', subdir, fname)
+    else:
+        return []
+    candidates = sorted(glob.glob(glob_pat), key=os.path.getmtime, reverse=True)
+    if scope == 'inlp_actadd':
+        cur_cell = cfg.actadd_path()
+        candidates = [c for c in candidates
+                      if _best_inlp_matches(os.path.dirname(os.path.dirname(c)), cur_cell)]
+    return candidates
+
+
 def _maybe_write_completions(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks,
-                             label, dataset_name, dataset=None):
+                             label, dataset_name, dataset=None, reuse_from=None):
     os.makedirs(os.path.join(dir_path, 'completions'), exist_ok=True)
     out_path = os.path.join(dir_path, 'completions', f'{dataset_name}_{label}_completions.json')
     if not cfg.force_overwrite and os.path.exists(out_path):
         print(f"Skipping {dataset_name}/{label}: {out_path} already exists")
+        return
+    if not cfg.force_overwrite and reuse_from and _try_link_from_siblings(out_path, reuse_from):
         return
     if dataset is None:
         dataset = load_dataset(dataset_name)
@@ -296,7 +353,8 @@ def _maybe_write_completions(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks
         json.dump(completions, f, indent=4)
 
 
-def _maybe_evaluate_completions(cfg, dir_path, label, dataset_name, methodologies, lg2_classifier=None):
+def _maybe_evaluate_completions(cfg, dir_path, label, dataset_name, methodologies,
+                                lg2_classifier=None, reuse_from=None):
     comp_path = os.path.join(dir_path, 'completions', f'{dataset_name}_{label}_completions.json')
     eval_path = os.path.join(dir_path, 'completions', f'{dataset_name}_{label}_evaluations.json')
     if not os.path.exists(comp_path):
@@ -304,6 +362,8 @@ def _maybe_evaluate_completions(cfg, dir_path, label, dataset_name, methodologie
         return
     if not cfg.force_overwrite and os.path.exists(eval_path):
         print(f"Skipping eval {dataset_name}/{label}: {eval_path} already exists")
+        return
+    if not cfg.force_overwrite and reuse_from and _try_link_from_siblings(eval_path, reuse_from):
         return
     with open(comp_path, 'r') as f:
         completions = json.load(f)
@@ -316,11 +376,14 @@ def _maybe_evaluate_completions(cfg, dir_path, label, dataset_name, methodologie
     )
 
 
-def _maybe_evaluate_loss(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks, label):
+def _maybe_evaluate_loss(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks, label,
+                         reuse_from=None):
     os.makedirs(os.path.join(dir_path, 'loss_evals'), exist_ok=True)
     out_path = os.path.join(dir_path, 'loss_evals', f'{label}_loss_eval.json')
     if not cfg.force_overwrite and os.path.exists(out_path):
         print(f"Skipping loss eval {label}: already exists")
+        return
+    if not cfg.force_overwrite and reuse_from and _try_link_from_siblings(out_path, reuse_from):
         return
     on_dist_path = os.path.join(dir_path, 'completions', 'harmless_baseline_completions.json')
     loss_evals = evaluate_loss(
@@ -334,11 +397,14 @@ def _maybe_evaluate_loss(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks, la
         json.dump(loss_evals, f, indent=4)
 
 
-def _maybe_evaluate_benchmarks(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks, label):
+def _maybe_evaluate_benchmarks(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks, label,
+                               reuse_from=None):
     os.makedirs(os.path.join(dir_path, 'benchmark_evals'), exist_ok=True)
     out_path = os.path.join(dir_path, 'benchmark_evals', f'{label}_benchmark_eval.json')
     if not cfg.force_overwrite and os.path.exists(out_path):
         print(f"Skipping benchmark eval {label}: already exists")
+        return
+    if not cfg.force_overwrite and reuse_from and _try_link_from_siblings(out_path, reuse_from):
         return
     evals = evaluate_benchmarks(
         model_base, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
@@ -390,8 +456,32 @@ def _run_extraction(cfg):
         torch.cuda.empty_cache()
 
 
+def _selection_cache_path(cell_dir):
+    return os.path.join(cell_dir, 'selected_components.pt')
+
+
+def _sibling_selection_caches(cfg):
+    """Sibling selection caches for the same k (any mode); selection is
+    mode-independent, so just_1__<k> and all__<k> share the same result."""
+    root = cfg.extraction_path()
+    pat = os.path.join(root, f'*__{cfg.k_label()}', 'selected_components.pt')
+    return sorted(glob.glob(pat), key=os.path.getmtime, reverse=True)
+
+
 def _select_best_components(cfg, model_base):
-    """Rank candidates and return (best_ablation, best_inlp, n_ablation, n_inlp)."""
+    """Rank candidates and return (best_ablation, best_inlp, n_ablation, n_inlp, top_direction_norm).
+    Cached per-cell at <cell>/selected_components.pt; reused across modes for the same k."""
+    cache_path = _selection_cache_path(cfg.artifact_path())
+
+    if not cfg.force_overwrite:
+        if not os.path.exists(cache_path):
+            _try_link_from_siblings(cache_path, _sibling_selection_caches(cfg))
+        if os.path.exists(cache_path):
+            print(f"Loading cached selection from {cache_path}")
+            cached = torch.load(cache_path, map_location='cpu', weights_only=False)
+            return (cached['best_ablation'], cached['best_inlp'],
+                    cached['n_abl'], cached['n_inlp'], cached['top_direction_norm'])
+
     h_train, hl_train, h_val, hl_val, _ = load_dataset_artifacts(cfg)
 
     mean_diffs_path = os.path.join(cfg.extraction_path(), 'generate_directions', 'mean_diffs.pt')
@@ -412,7 +502,18 @@ def _select_best_components(cfg, model_base):
 
     best_ablation = filtered_ablation[0]
     best_inlp = filtered_inlp[0]
-    return best_ablation, best_inlp, len(filtered_ablation), len(filtered_inlp), top_direction_norm
+    n_abl, n_inlp = len(filtered_ablation), len(filtered_inlp)
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save({
+        'best_ablation': best_ablation,
+        'best_inlp': best_inlp,
+        'n_abl': n_abl,
+        'n_inlp': n_inlp,
+        'top_direction_norm': top_direction_norm,
+    }, cache_path)
+
+    return best_ablation, best_inlp, n_abl, n_inlp, top_direction_norm
 
 
 def _run_selection(cfg):
@@ -493,9 +594,13 @@ def _run_inference(cfg):
     # ── Mode dir: baseline + ablation + reflection ──────────────────────────
     for dataset_name in cfg.evaluation_datasets:
         _maybe_write_completions(cfg, mode_dir, model_base, baseline_pre, baseline_post,
-                                 'baseline', dataset_name)
+                                 'baseline', dataset_name,
+                                 reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                     f'{dataset_name}_baseline_completions.json'))
         _maybe_write_completions(cfg, mode_dir, model_base, ablation_pre, ablation_post,
-                                 'ablation', dataset_name)
+                                 'ablation', dataset_name,
+                                 reuse_from=_sibling_sources(cfg, 'same_mode', 'completions',
+                                     f'{dataset_name}_ablation_completions.json'))
         for alpha in cfg.reflection_alphas:
             label = f'reflection_a{alpha:.2f}'
             refl_pre, refl_post = _build_reflection_hooks(cfg, model_base, best_inlp_layer, best_P, alpha)
@@ -503,7 +608,9 @@ def _run_inference(cfg):
                                      label, dataset_name)
 
     _maybe_write_completions(cfg, mode_dir, model_base, baseline_pre, baseline_post,
-                             'baseline', 'harmless', dataset=harmless_test)
+                             'baseline', 'harmless', dataset=harmless_test,
+                             reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                 'harmless_baseline_completions.json'))
     for alpha in cfg.reflection_alphas:
         label = f'reflection_a{alpha:.2f}'
         refl_pre, refl_post = _build_reflection_hooks(cfg, model_base, best_inlp_layer, best_P, alpha)
@@ -511,10 +618,14 @@ def _run_inference(cfg):
                                  label, 'harmless', dataset=harmless_test)
 
     # Loss + benchmark evals for mode dir
-    _maybe_evaluate_loss(cfg, mode_dir, model_base, baseline_pre, baseline_post, 'baseline')
-    _maybe_evaluate_benchmarks(cfg, mode_dir, model_base, baseline_pre, baseline_post, 'baseline')
-    _maybe_evaluate_loss(cfg, mode_dir, model_base, ablation_pre, ablation_post, 'ablation')
-    _maybe_evaluate_benchmarks(cfg, mode_dir, model_base, ablation_pre, ablation_post, 'ablation')
+    _maybe_evaluate_loss(cfg, mode_dir, model_base, baseline_pre, baseline_post, 'baseline',
+                         reuse_from=_sibling_sources(cfg, 'any', 'loss_evals', 'baseline_loss_eval.json'))
+    _maybe_evaluate_benchmarks(cfg, mode_dir, model_base, baseline_pre, baseline_post, 'baseline',
+                               reuse_from=_sibling_sources(cfg, 'any', 'benchmark_evals', 'baseline_benchmark_eval.json'))
+    _maybe_evaluate_loss(cfg, mode_dir, model_base, ablation_pre, ablation_post, 'ablation',
+                         reuse_from=_sibling_sources(cfg, 'same_mode', 'loss_evals', 'ablation_loss_eval.json'))
+    _maybe_evaluate_benchmarks(cfg, mode_dir, model_base, ablation_pre, ablation_post, 'ablation',
+                               reuse_from=_sibling_sources(cfg, 'same_mode', 'benchmark_evals', 'ablation_benchmark_eval.json'))
     for alpha in cfg.reflection_alphas:
         label = f'reflection_a{alpha:.2f}'
         refl_pre, refl_post = _build_reflection_hooks(cfg, model_base, best_inlp_layer, best_P, alpha)
@@ -524,48 +635,66 @@ def _run_inference(cfg):
     # ── Actadd dir: baseline + actadd + inlp_actadd (shared across modes) ───
     for dataset_name in cfg.evaluation_datasets:
         _maybe_write_completions(cfg, actadd_dir, model_base, baseline_pre, baseline_post,
-                                 'baseline', dataset_name)
+                                 'baseline', dataset_name,
+                                 reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                     f'{dataset_name}_baseline_completions.json'))
         for coeff in actadd_coeffs:
             aa_label = f'actadd_c{coeff:.2f}'
             aa_hooks = [(model_base.model_block_modules[best_layer],
                          get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
-            _maybe_write_completions(cfg, actadd_dir, model_base, aa_hooks, [], aa_label, dataset_name)
+            _maybe_write_completions(cfg, actadd_dir, model_base, aa_hooks, [], aa_label, dataset_name,
+                                     reuse_from=_sibling_sources(cfg, 'actadd', 'completions',
+                                         f'{dataset_name}_{aa_label}_completions.json'))
 
             inlp_label = f'inlp_actadd_c{coeff:.2f}'
             inlp_hooks = [(model_base.model_block_modules[best_inlp_layer],
                            get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
-            _maybe_write_completions(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label, dataset_name)
+            _maybe_write_completions(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label, dataset_name,
+                                     reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'completions',
+                                         f'{dataset_name}_{inlp_label}_completions.json'))
 
     _maybe_write_completions(cfg, actadd_dir, model_base, baseline_pre, baseline_post,
-                             'baseline', 'harmless', dataset=harmless_test)
+                             'baseline', 'harmless', dataset=harmless_test,
+                             reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                 'harmless_baseline_completions.json'))
     for coeff in actadd_coeffs:
         aa_label = f'actadd_c{coeff:.2f}'
         aa_hooks = [(model_base.model_block_modules[best_layer],
                      get_activation_addition_input_pre_hook(vector=direction_unit, coeff=+coeff))]
         _maybe_write_completions(cfg, actadd_dir, model_base, aa_hooks, [], aa_label,
-                                 'harmless', dataset=harmless_test)
+                                 'harmless', dataset=harmless_test,
+                                 reuse_from=_sibling_sources(cfg, 'actadd', 'completions',
+                                     f'harmless_{aa_label}_completions.json'))
 
         inlp_label = f'inlp_actadd_c{coeff:.2f}'
         inlp_hooks = [(model_base.model_block_modules[best_inlp_layer],
                        get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=+coeff))]
         _maybe_write_completions(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label,
-                                 'harmless', dataset=harmless_test)
+                                 'harmless', dataset=harmless_test,
+                                 reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'completions',
+                                     f'harmless_{inlp_label}_completions.json'))
 
     # Loss + benchmark evals for actadd dir
-    _maybe_evaluate_loss(cfg, actadd_dir, model_base, baseline_pre, baseline_post, 'baseline')
-    _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, baseline_pre, baseline_post, 'baseline')
+    _maybe_evaluate_loss(cfg, actadd_dir, model_base, baseline_pre, baseline_post, 'baseline',
+                         reuse_from=_sibling_sources(cfg, 'any', 'loss_evals', 'baseline_loss_eval.json'))
+    _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, baseline_pre, baseline_post, 'baseline',
+                               reuse_from=_sibling_sources(cfg, 'any', 'benchmark_evals', 'baseline_benchmark_eval.json'))
     for coeff in actadd_coeffs:
         aa_label = f'actadd_c{coeff:.2f}'
         aa_hooks = [(model_base.model_block_modules[best_layer],
                      get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
-        _maybe_evaluate_loss(cfg, actadd_dir, model_base, aa_hooks, [], aa_label)
-        _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, aa_hooks, [], aa_label)
+        _maybe_evaluate_loss(cfg, actadd_dir, model_base, aa_hooks, [], aa_label,
+                             reuse_from=_sibling_sources(cfg, 'actadd', 'loss_evals', f'{aa_label}_loss_eval.json'))
+        _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, aa_hooks, [], aa_label,
+                                   reuse_from=_sibling_sources(cfg, 'actadd', 'benchmark_evals', f'{aa_label}_benchmark_eval.json'))
 
         inlp_label = f'inlp_actadd_c{coeff:.2f}'
         inlp_hooks = [(model_base.model_block_modules[best_inlp_layer],
                        get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
-        _maybe_evaluate_loss(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label)
-        _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label)
+        _maybe_evaluate_loss(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label,
+                             reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'loss_evals', f'{inlp_label}_loss_eval.json'))
+        _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label,
+                                   reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'benchmark_evals', f'{inlp_label}_benchmark_eval.json'))
 
     model_base.del_model()
     del model_base
@@ -589,14 +718,20 @@ def _run_evaluation(cfg):
     if os.path.isdir(mode_dir):
         for dataset_name in cfg.evaluation_datasets:
             _maybe_evaluate_completions(cfg, mode_dir, 'baseline', dataset_name,
-                                        cfg.jailbreak_eval_methodologies, lg2)
+                                        cfg.jailbreak_eval_methodologies, lg2,
+                                        reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                            f'{dataset_name}_baseline_evaluations.json'))
             _maybe_evaluate_completions(cfg, mode_dir, 'ablation', dataset_name,
-                                        cfg.jailbreak_eval_methodologies, lg2)
+                                        cfg.jailbreak_eval_methodologies, lg2,
+                                        reuse_from=_sibling_sources(cfg, 'same_mode', 'completions',
+                                            f'{dataset_name}_ablation_evaluations.json'))
             for alpha in cfg.reflection_alphas:
                 _maybe_evaluate_completions(cfg, mode_dir, f'reflection_a{alpha:.2f}',
                                             dataset_name, cfg.jailbreak_eval_methodologies, lg2)
         _maybe_evaluate_completions(cfg, mode_dir, 'baseline', 'harmless',
-                                    cfg.refusal_eval_methodologies)
+                                    cfg.refusal_eval_methodologies,
+                                    reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                        'harmless_baseline_evaluations.json'))
         for alpha in cfg.reflection_alphas:
             _maybe_evaluate_completions(cfg, mode_dir, f'reflection_a{alpha:.2f}',
                                         'harmless', cfg.refusal_eval_methodologies)
@@ -612,19 +747,35 @@ def _run_evaluation(cfg):
     if os.path.isdir(actadd_dir):
         for dataset_name in cfg.evaluation_datasets:
             _maybe_evaluate_completions(cfg, actadd_dir, 'baseline', dataset_name,
-                                        cfg.jailbreak_eval_methodologies, lg2)
+                                        cfg.jailbreak_eval_methodologies, lg2,
+                                        reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                            f'{dataset_name}_baseline_evaluations.json'))
             for coeff in actadd_coeffs:
-                _maybe_evaluate_completions(cfg, actadd_dir, f'actadd_c{coeff:.2f}',
-                                            dataset_name, cfg.jailbreak_eval_methodologies, lg2)
-                _maybe_evaluate_completions(cfg, actadd_dir, f'inlp_actadd_c{coeff:.2f}',
-                                            dataset_name, cfg.jailbreak_eval_methodologies, lg2)
+                aa_label = f'actadd_c{coeff:.2f}'
+                _maybe_evaluate_completions(cfg, actadd_dir, aa_label,
+                                            dataset_name, cfg.jailbreak_eval_methodologies, lg2,
+                                            reuse_from=_sibling_sources(cfg, 'actadd', 'completions',
+                                                f'{dataset_name}_{aa_label}_evaluations.json'))
+                inlp_label = f'inlp_actadd_c{coeff:.2f}'
+                _maybe_evaluate_completions(cfg, actadd_dir, inlp_label,
+                                            dataset_name, cfg.jailbreak_eval_methodologies, lg2,
+                                            reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'completions',
+                                                f'{dataset_name}_{inlp_label}_evaluations.json'))
         _maybe_evaluate_completions(cfg, actadd_dir, 'baseline', 'harmless',
-                                    cfg.refusal_eval_methodologies)
+                                    cfg.refusal_eval_methodologies,
+                                    reuse_from=_sibling_sources(cfg, 'any', 'completions',
+                                        'harmless_baseline_evaluations.json'))
         for coeff in actadd_coeffs:
-            _maybe_evaluate_completions(cfg, actadd_dir, f'actadd_c{coeff:.2f}',
-                                        'harmless', cfg.refusal_eval_methodologies)
-            _maybe_evaluate_completions(cfg, actadd_dir, f'inlp_actadd_c{coeff:.2f}',
-                                        'harmless', cfg.refusal_eval_methodologies)
+            aa_label = f'actadd_c{coeff:.2f}'
+            _maybe_evaluate_completions(cfg, actadd_dir, aa_label,
+                                        'harmless', cfg.refusal_eval_methodologies,
+                                        reuse_from=_sibling_sources(cfg, 'actadd', 'completions',
+                                            f'harmless_{aa_label}_evaluations.json'))
+            inlp_label = f'inlp_actadd_c{coeff:.2f}'
+            _maybe_evaluate_completions(cfg, actadd_dir, inlp_label,
+                                        'harmless', cfg.refusal_eval_methodologies,
+                                        reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'completions',
+                                            f'harmless_{inlp_label}_evaluations.json'))
 
     if lg2 is not None:
         lg2.cleanup()
