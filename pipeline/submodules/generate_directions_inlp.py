@@ -96,12 +96,12 @@ def _run_inlp(
 
     for _ in range(n_classifiers):
         W = torch.zeros(d, device=device, dtype=dtype, requires_grad=True)
-        b = torch.zeros(1, device=device, dtype=dtype, requires_grad=True)
-        opt = torch.optim.LBFGS([W, b], lr=1.0, max_iter=200, tolerance_grad=1e-5)
+        #b = torch.zeros(1, device=device, dtype=dtype, requires_grad=True)
+        opt = torch.optim.LBFGS([W], lr=1.0, max_iter=200, tolerance_grad=1e-5)
 
         def closure():
             opt.zero_grad()
-            loss = F.binary_cross_entropy_with_logits(Xtr_proj @ W + b, Ytr)
+            loss = F.binary_cross_entropy_with_logits(Xtr_proj @ W, Ytr)
             loss = loss + lam * W.pow(2).sum()
             loss.backward()
             return loss
@@ -109,7 +109,7 @@ def _run_inlp(
         opt.step(closure)
 
         with torch.no_grad():
-            preds = (Xdv_proj @ W + b > 0).cpu()
+            preds = (Xdv_proj @ W > 0).cpu()
             acc = (preds == Ydv.bool()).float().mean().item()
 
         Wmat = W.detach().unsqueeze(0)  # (1, d)
