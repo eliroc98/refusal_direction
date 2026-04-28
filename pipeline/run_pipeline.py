@@ -287,11 +287,20 @@ def _try_link_from_siblings(target_path, candidate_sources):
     for src in candidate_sources:
         if src == target_path or not os.path.exists(src):
             continue
+        if os.path.exists(target_path):
+            try:
+                if os.path.samefile(src, target_path):
+                    return False
+            except OSError:
+                return False
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
         try:
             os.link(src, target_path)
         except OSError:
-            shutil.copyfile(src, target_path)
+            try:
+                shutil.copyfile(src, target_path)
+            except shutil.SameFileError:
+                return False
         print(f"Reused {target_path} from sibling {src}")
         return True
     return False
@@ -354,25 +363,58 @@ def _maybe_write_completions(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks
 
 
 def _maybe_evaluate_completions(cfg, dir_path, label, dataset_name, methodologies,
-                                lg2_classifier=None, reuse_from=None):
+                                lg2_classifier=None, llm_refusal_judge_classifier=None,
+                                reuse_from=None):
+    methodology_to_keys = {
+        "substring_matching": ("substring_matching_success_rate", "substring_matching_per_category"),
+        "llamaguard2": ("llamaguard2_success_rate", "llamaguard2_per_category"),
+        "harmbench": ("harmbench_success_rate", "harmbench_per_category"),
+        "llm_refusal_judge": (
+            "llm_refusal_judge_refusal_rate",
+            "llm_refusal_judge_non_refusal_rate",
+            "llm_refusal_judge_per_category",
+        ),
+    }
     comp_path = os.path.join(dir_path, 'completions', f'{dataset_name}_{label}_completions.json')
     eval_path = os.path.join(dir_path, 'completions', f'{dataset_name}_{label}_evaluations.json')
     if not os.path.exists(comp_path):
         print(f"Skipping eval {dataset_name}/{label}: completions file missing")
         return
-    if not cfg.force_overwrite and os.path.exists(eval_path):
-        print(f"Skipping eval {dataset_name}/{label}: {eval_path} already exists")
-        return
-    if not cfg.force_overwrite and reuse_from and _try_link_from_siblings(eval_path, reuse_from):
-        return
-    with open(comp_path, 'r') as f:
-        completions = json.load(f)
+
+    existing_evaluation = None
+    if os.path.exists(eval_path):
+        with open(eval_path, 'r') as f:
+            existing_evaluation = json.load(f)
+    elif not cfg.force_overwrite and reuse_from and _try_link_from_siblings(eval_path, reuse_from):
+        with open(eval_path, 'r') as f:
+            existing_evaluation = json.load(f)
+
+    if cfg.force_overwrite or not isinstance(existing_evaluation, dict):
+        missing_methodologies = list(methodologies)
+    else:
+        missing_methodologies = [
+            methodology
+            for methodology in methodologies
+            if not all(key in existing_evaluation for key in methodology_to_keys.get(methodology, ()))
+        ]
+        if not missing_methodologies:
+            print(f"Skipping eval {dataset_name}/{label}: all requested methodologies already exist in {eval_path}")
+            return
+
+    if isinstance(existing_evaluation, dict) and isinstance(existing_evaluation.get("completions"), list) and not cfg.force_overwrite:
+        completions = existing_evaluation["completions"]
+    else:
+        with open(comp_path, 'r') as f:
+            completions = json.load(f)
+
     evaluate_jailbreak(
         completions=completions,
-        methodologies=methodologies,
+        methodologies=missing_methodologies,
         evaluation_path=eval_path,
         vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
         llamaguard2_classifier=lg2_classifier,
+        llm_refusal_judge_classifier=llm_refusal_judge_classifier,
+        existing_evaluation=None if cfg.force_overwrite else existing_evaluation,
     )
 
 
@@ -704,37 +746,54 @@ def _run_inference(cfg):
 
 
 def _run_evaluation(cfg):
-    """LlamaGuard2 / substring evaluation on completions in mode dir + actadd dir."""
+    """Run configured jailbreak / refusal evaluation on completions in mode dir + actadd dir."""
     if cfg.device not in ('auto', 'cpu'):
         os.environ['CUDA_VISIBLE_DEVICES'] = cfg.device.split(':')[-1]
 
-    from pipeline.submodules.evaluate_jailbreak import LlamaGuard2Classifier
+    from pipeline.submodules.evaluate_jailbreak import (
+        LLMRefusalJudgeClassifier,
+        LlamaGuard2Classifier,
+    )
     lg2 = None
-    if "llamaguard2" in cfg.jailbreak_eval_methodologies:
+    llm_refusal_judge = None
+    has_llm_refusal_judge = (
+        "llm_refusal_judge" in cfg.jailbreak_eval_methodologies
+        or "llm_refusal_judge" in cfg.refusal_eval_methodologies
+    )
+    # Avoid keeping two vLLM judge models resident at once on a single GPU.
+    # When both judges are enabled, evaluate_jailbreak will instantiate them
+    # sequentially inside each file evaluation instead.
+    if "llamaguard2" in cfg.jailbreak_eval_methodologies and not has_llm_refusal_judge:
         lg2 = LlamaGuard2Classifier(gpu_memory_utilization=cfg.vllm_gpu_memory_utilization)
+    if has_llm_refusal_judge and "llamaguard2" not in cfg.jailbreak_eval_methodologies:
+        llm_refusal_judge = LLMRefusalJudgeClassifier(
+            gpu_memory_utilization=cfg.vllm_gpu_memory_utilization
+        )
 
     # Mode dir: baseline + ablation + reflection labels
     mode_dir = cfg.artifact_path()
     if os.path.isdir(mode_dir):
         for dataset_name in cfg.evaluation_datasets:
             _maybe_evaluate_completions(cfg, mode_dir, 'baseline', dataset_name,
-                                        cfg.jailbreak_eval_methodologies, lg2,
+                                        cfg.jailbreak_eval_methodologies, lg2, llm_refusal_judge,
                                         reuse_from=_sibling_sources(cfg, 'any', 'completions',
                                             f'{dataset_name}_baseline_evaluations.json'))
             _maybe_evaluate_completions(cfg, mode_dir, 'ablation', dataset_name,
-                                        cfg.jailbreak_eval_methodologies, lg2,
+                                        cfg.jailbreak_eval_methodologies, lg2, llm_refusal_judge,
                                         reuse_from=_sibling_sources(cfg, 'same_mode', 'completions',
                                             f'{dataset_name}_ablation_evaluations.json'))
             for alpha in cfg.reflection_alphas:
                 _maybe_evaluate_completions(cfg, mode_dir, f'reflection_a{alpha:.2f}',
-                                            dataset_name, cfg.jailbreak_eval_methodologies, lg2)
+                                            dataset_name, cfg.jailbreak_eval_methodologies, lg2,
+                                            llm_refusal_judge)
         _maybe_evaluate_completions(cfg, mode_dir, 'baseline', 'harmless',
-                                    cfg.refusal_eval_methodologies,
+                                    cfg.refusal_eval_methodologies, None, llm_refusal_judge,
                                     reuse_from=_sibling_sources(cfg, 'any', 'completions',
                                         'harmless_baseline_evaluations.json'))
         for alpha in cfg.reflection_alphas:
             _maybe_evaluate_completions(cfg, mode_dir, f'reflection_a{alpha:.2f}',
-                                        'harmless', cfg.refusal_eval_methodologies)
+                                        'harmless', cfg.refusal_eval_methodologies, None,
+                                        llm_refusal_judge)
 
     # Actadd dir: baseline + actadd + inlp_actadd labels
     actadd_dir = cfg.actadd_path()
@@ -747,38 +806,44 @@ def _run_evaluation(cfg):
     if os.path.isdir(actadd_dir):
         for dataset_name in cfg.evaluation_datasets:
             _maybe_evaluate_completions(cfg, actadd_dir, 'baseline', dataset_name,
-                                        cfg.jailbreak_eval_methodologies, lg2,
+                                        cfg.jailbreak_eval_methodologies, lg2, llm_refusal_judge,
                                         reuse_from=_sibling_sources(cfg, 'any', 'completions',
                                             f'{dataset_name}_baseline_evaluations.json'))
             for coeff in actadd_coeffs:
                 aa_label = f'actadd_c{coeff:.2f}'
                 _maybe_evaluate_completions(cfg, actadd_dir, aa_label,
                                             dataset_name, cfg.jailbreak_eval_methodologies, lg2,
+                                            llm_refusal_judge,
                                             reuse_from=_sibling_sources(cfg, 'actadd', 'completions',
                                                 f'{dataset_name}_{aa_label}_evaluations.json'))
                 inlp_label = f'inlp_actadd_c{coeff:.2f}'
                 _maybe_evaluate_completions(cfg, actadd_dir, inlp_label,
                                             dataset_name, cfg.jailbreak_eval_methodologies, lg2,
+                                            llm_refusal_judge,
                                             reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'completions',
                                                 f'{dataset_name}_{inlp_label}_evaluations.json'))
         _maybe_evaluate_completions(cfg, actadd_dir, 'baseline', 'harmless',
-                                    cfg.refusal_eval_methodologies,
+                                    cfg.refusal_eval_methodologies, None, llm_refusal_judge,
                                     reuse_from=_sibling_sources(cfg, 'any', 'completions',
                                         'harmless_baseline_evaluations.json'))
         for coeff in actadd_coeffs:
             aa_label = f'actadd_c{coeff:.2f}'
             _maybe_evaluate_completions(cfg, actadd_dir, aa_label,
-                                        'harmless', cfg.refusal_eval_methodologies,
+                                        'harmless', cfg.refusal_eval_methodologies, None,
+                                        llm_refusal_judge,
                                         reuse_from=_sibling_sources(cfg, 'actadd', 'completions',
                                             f'harmless_{aa_label}_evaluations.json'))
             inlp_label = f'inlp_actadd_c{coeff:.2f}'
             _maybe_evaluate_completions(cfg, actadd_dir, inlp_label,
-                                        'harmless', cfg.refusal_eval_methodologies,
+                                        'harmless', cfg.refusal_eval_methodologies, None,
+                                        llm_refusal_judge,
                                         reuse_from=_sibling_sources(cfg, 'inlp_actadd', 'completions',
                                             f'harmless_{inlp_label}_evaluations.json'))
 
     if lg2 is not None:
         lg2.cleanup()
+    if llm_refusal_judge is not None:
+        llm_refusal_judge.cleanup()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

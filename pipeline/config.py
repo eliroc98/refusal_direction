@@ -21,8 +21,8 @@ class Config:
     filter_val: bool = True
     evaluation_datasets: Tuple[str] = ("jailbreakbench",)
     max_new_tokens: int = 512
-    jailbreak_eval_methodologies: Tuple[str] = ("substring_matching", "llamaguard2")
-    refusal_eval_methodologies: Tuple[str] = ("substring_matching",)
+    jailbreak_eval_methodologies: Tuple[str] = ("substring_matching", "llamaguard2", "llm_refusal_judge")
+    refusal_eval_methodologies: Tuple[str] = ("substring_matching", "llm_refusal_judge")
     ce_loss_batch_size: int = 2
     ce_loss_n_batches: int = 2048
 
