@@ -62,10 +62,14 @@ def parse_arguments():
                         help='Run completions + loss + benchmark evals from pre-selected best components.')
     parser.add_argument('--resume_from_eval', action='store_true',
                         help='Skip inference and run LlamaGuard evaluation on existing completions.')
+    parser.add_argument('--performance_eval_only', action='store_true',
+                        help='Skip inference and refusal/jailbreak judges; rerun only loss and benchmark evals.')
     parser.add_argument('--skip_eval', action='store_true',
                         help='Run inference; skip LlamaGuard evaluation.')
     parser.add_argument('--force_overwrite', action='store_true',
                         help='Regenerate completion/eval files even if they exist.')
+    parser.add_argument('--force_performance_eval', action='store_true',
+                        help='Overwrite only loss/benchmark eval files when used with --performance_eval_only.')
     return parser.parse_args()
 
 
@@ -502,6 +506,18 @@ def _selection_cache_path(cell_dir):
     return os.path.join(cell_dir, 'selected_components.pt')
 
 
+def _load_selected_components_for_eval(cfg):
+    """Load cached selected components without recomputing selection artifacts."""
+    cache_path = _selection_cache_path(cfg.artifact_path())
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Missing cached selection at {cache_path}. "
+            "Run selection/inference for this cell before --performance_eval_only."
+        )
+    cached = torch.load(cache_path, map_location='cpu', weights_only=False)
+    return cached['best_ablation'], cached['best_inlp'], cached.get('top_direction_norm')
+
+
 def _sibling_selection_caches(cfg):
     """Sibling selection caches for the same k (any mode); selection is
     mode-independent, so just_1__<k> and all__<k> share the same result."""
@@ -745,6 +761,65 @@ def _run_inference(cfg):
         torch.cuda.empty_cache()
 
 
+def _run_performance_evaluation(cfg):
+    """Rerun only loss + benchmark evals for the current (component_mode, k) cell."""
+    model_base = construct_model_base(cfg.model_path, device=cfg.device)
+    best_ablation, best_inlp, _ = _load_selected_components_for_eval(cfg)
+
+    best_direction = best_ablation['direction']
+    best_layer = best_ablation['layer']
+    best_inlp_direction = best_inlp['direction']
+    best_inlp_layer = best_inlp['layer']
+    best_P = best_inlp['P']
+
+    direction_norm = torch.norm(best_direction).item()
+    direction_unit = best_direction / (direction_norm + 1e-8)
+    inlp_direction_unit = best_inlp_direction / (torch.norm(best_inlp_direction) + 1e-8)
+    actadd_coeffs = [m * direction_norm for m in ACTADD_TARGET_MULTIPLIERS]
+
+    mode_dir = cfg.artifact_path()
+    actadd_dir = cfg.actadd_path()
+
+    baseline_pre, baseline_post = [], []
+    ablation_pre, ablation_post = _build_ablation_hooks(cfg, model_base, best_layer, best_direction)
+
+    print(
+        f"Performance eval only: mode={cfg.component_mode}, k={cfg.k_label()}, "
+        f"direction_norm={direction_norm:.4f}"
+    )
+
+    _maybe_evaluate_loss(cfg, mode_dir, model_base, baseline_pre, baseline_post, 'baseline')
+    _maybe_evaluate_benchmarks(cfg, mode_dir, model_base, baseline_pre, baseline_post, 'baseline')
+    _maybe_evaluate_loss(cfg, mode_dir, model_base, ablation_pre, ablation_post, 'ablation')
+    _maybe_evaluate_benchmarks(cfg, mode_dir, model_base, ablation_pre, ablation_post, 'ablation')
+    for alpha in cfg.reflection_alphas:
+        label = f'reflection_a{alpha:.2f}'
+        refl_pre, refl_post = _build_reflection_hooks(cfg, model_base, best_inlp_layer, best_P, alpha)
+        _maybe_evaluate_loss(cfg, mode_dir, model_base, refl_pre, refl_post, label)
+        _maybe_evaluate_benchmarks(cfg, mode_dir, model_base, refl_pre, refl_post, label)
+
+    _maybe_evaluate_loss(cfg, actadd_dir, model_base, baseline_pre, baseline_post, 'baseline')
+    _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, baseline_pre, baseline_post, 'baseline')
+    for coeff in actadd_coeffs:
+        aa_label = f'actadd_c{coeff:.2f}'
+        aa_hooks = [(model_base.model_block_modules[best_layer],
+                     get_activation_addition_input_pre_hook(vector=direction_unit, coeff=-coeff))]
+        _maybe_evaluate_loss(cfg, actadd_dir, model_base, aa_hooks, [], aa_label)
+        _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, aa_hooks, [], aa_label)
+
+        inlp_label = f'inlp_actadd_c{coeff:.2f}'
+        inlp_hooks = [(model_base.model_block_modules[best_inlp_layer],
+                       get_activation_addition_input_pre_hook(vector=inlp_direction_unit, coeff=-coeff))]
+        _maybe_evaluate_loss(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label)
+        _maybe_evaluate_benchmarks(cfg, actadd_dir, model_base, inlp_hooks, [], inlp_label)
+
+    model_base.del_model()
+    del model_base
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _run_evaluation(cfg):
     """Run configured jailbreak / refusal evaluation on completions in mode dir + actadd dir."""
     if cfg.device not in ('auto', 'cpu'):
@@ -853,8 +928,8 @@ def _run_evaluation(cfg):
 def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
                  component_mode='just_1', inlp_k_policy='none', inlp_k_restrict=None,
                  reflection_alphas=None, extract_only=False, select_only=False,
-                 infer_only=False, resume_from_eval=False, skip_eval=False,
-                 force_overwrite=False):
+                 infer_only=False, resume_from_eval=False, performance_eval_only=False,
+                 skip_eval=False, force_overwrite=False, force_performance_eval=False):
     model_alias = os.path.basename(model_path)
     cfg = Config(
         model_alias=model_alias, model_path=model_path, device=device,
@@ -862,12 +937,15 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
         component_mode=component_mode,
         inlp_k_policy=inlp_k_policy, inlp_k_restrict=inlp_k_restrict,
         reflection_alphas=tuple(reflection_alphas) if reflection_alphas else (1.0, 2.0),
-        force_overwrite=force_overwrite,
+        force_overwrite=force_overwrite or (performance_eval_only and force_performance_eval),
     )
 
-    phase_flags = [extract_only, select_only, infer_only]
+    phase_flags = [extract_only, select_only, infer_only, performance_eval_only]
     if sum(1 for f in phase_flags if f) > 1:
-        raise ValueError("Use at most one of --extract_only, --select_only, --infer_only.")
+        raise ValueError("Use at most one of --extract_only, --select_only, --infer_only, --performance_eval_only.")
+
+    if force_performance_eval and not performance_eval_only:
+        raise ValueError("--force_performance_eval requires --performance_eval_only.")
 
     if extract_only:
         if resume_from_eval:
@@ -879,6 +957,12 @@ def run_pipeline(model_path, device='auto', vllm_gpu_memory_utilization=0.9,
         if resume_from_eval:
             raise ValueError("--select_only is incompatible with --resume_from_eval.")
         _run_selection(cfg)
+        return
+
+    if performance_eval_only:
+        if resume_from_eval:
+            raise ValueError("--performance_eval_only is incompatible with --resume_from_eval.")
+        _run_performance_evaluation(cfg)
         return
 
     if not resume_from_eval:
@@ -902,6 +986,8 @@ if __name__ == "__main__":
         select_only=args.select_only,
         infer_only=args.infer_only,
         resume_from_eval=args.resume_from_eval,
+        performance_eval_only=args.performance_eval_only,
         skip_eval=args.skip_eval,
         force_overwrite=args.force_overwrite,
+        force_performance_eval=args.force_performance_eval,
     )

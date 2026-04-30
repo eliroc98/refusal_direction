@@ -1,21 +1,52 @@
-import torch
 import itertools
+import hashlib
 import json
+import math
 import time
 
+import torch
 from datasets import load_dataset
 
 from pipeline.utils.hook_utils import add_hooks
 from pipeline.model_utils.model_base import ModelBase
 
-def batch_iterator_chat_completions(dataset_instructions, dataset_outputs, tokenize_instructions_fn, batch_size, eoi_toks):
+def _sample_std(values):
+    finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if len(finite) == 0:
+        return None
+    if len(finite) == 1:
+        return 0.0
+    mean = sum(finite) / len(finite)
+    return math.sqrt(sum((v - mean) ** 2 for v in finite) / (len(finite) - 1))
+
+
+def _text_preview(text, max_chars=160):
+    text = " ".join(str(text).split())
+    return text[:max_chars]
+
+
+def _safe_exp(value):
+    if value is None or not math.isfinite(float(value)) or value > 709:
+        return None
+    return math.exp(value)
+
+
+def batch_iterator_chat_completions(dataset_instructions, dataset_outputs, tokenize_instructions_fn, batch_size, eoi_toks, metadata=None):
     it_instructions = iter(dataset_instructions)
     it_outputs = iter(dataset_outputs)
+    it_metadata = iter(metadata) if metadata is not None else None
     while True:
         instructions_batch = list(itertools.islice(it_instructions, batch_size))
         outputs_batch = list(itertools.islice(it_outputs, batch_size))
         if not instructions_batch or not outputs_batch:
             break
+        if it_metadata is None:
+            metadata_batch = [
+                {"index": i, "prompt": instruction, "response": output}
+                for i, (instruction, output) in enumerate(zip(instructions_batch, outputs_batch))
+            ]
+        else:
+            metadata_batch = list(itertools.islice(it_metadata, batch_size))
         inputs = tokenize_instructions_fn(instructions=instructions_batch, outputs=outputs_batch)
 
         loss_mask = inputs["attention_mask"].clone()
@@ -34,20 +65,28 @@ def batch_iterator_chat_completions(dataset_instructions, dataset_outputs, token
                     loss_mask[b, :i + eoi_toks.shape[0] - 1] = 0
                     break
 
-        yield inputs, loss_mask 
+        yield inputs, loss_mask, metadata_batch
 
 def batch_iterator_custom_completions(completions_file_path: str, tokenize_instructions_fn, batch_size, eoi_toks):
     """Yields batches from the custom completions."""
 
-    custom_completions = json.load(open(completions_file_path, 'r'))
+    with open(completions_file_path, 'r') as f:
+        custom_completions = json.load(f)
 
-    instructions, completions = [], []
+    instructions, completions, metadata = [], [], []
 
     for i in range(len(custom_completions)):
-        instructions.append(custom_completions[i]['prompt'])
-        completions.append(custom_completions[i]['response'])
+        prompt = custom_completions[i]['prompt']
+        response = custom_completions[i]['response']
+        instructions.append(prompt)
+        completions.append(response)
+        metadata.append({
+            "index": i,
+            "prompt": prompt,
+            "response": response,
+        })
 
-    return batch_iterator_chat_completions(instructions, completions, tokenize_instructions_fn, batch_size, eoi_toks)
+    return batch_iterator_chat_completions(instructions, completions, tokenize_instructions_fn, batch_size, eoi_toks, metadata)
 
 def batch_iterator_alpaca(tokenize_instructions_fn, batch_size, eoi_toks):
     """Yields batches from the Alpaca dataset."""
@@ -55,14 +94,22 @@ def batch_iterator_alpaca(tokenize_instructions_fn, batch_size, eoi_toks):
     dataset = load_dataset("tatsu-lab/alpaca", split="train")
     dataset = dataset.shuffle(seed=42)
 
-    instructions, completions = [], []
+    instructions, completions, metadata = [], [], []
 
     for i in range(len(dataset)):
         if dataset[i]['input'].strip() == '': # filter for instructions that do not have inputs
-            instructions.append(dataset[i]['instruction'])
-            completions.append(dataset[i]['output'])
+            prompt = dataset[i]['instruction']
+            response = dataset[i]['output']
+            instructions.append(prompt)
+            completions.append(response)
+            metadata.append({
+                "index": len(metadata),
+                "dataset_index": i,
+                "prompt": prompt,
+                "response": response,
+            })
 
-    return batch_iterator_chat_completions(instructions, completions, tokenize_instructions_fn, batch_size, eoi_toks)
+    return batch_iterator_chat_completions(instructions, completions, tokenize_instructions_fn, batch_size, eoi_toks, metadata)
 
 def batch_iterator_pile(tokenizer, batch_size, max_length):
     """Yields batches from the Pile dataset."""
@@ -86,23 +133,36 @@ def batch_iterator_pile(tokenizer, batch_size, max_length):
                 raise e
 
     it_dataset = iter(dataset)
+    example_idx = 0
     while True:
         batch = list(itertools.islice(it_dataset, batch_size))
         if not batch:
             break
-        inputs = tokenizer([b['text'] for b in batch], return_tensors="pt", padding=True, truncation=True, max_length=max_length)
+        texts = [b['text'] for b in batch]
+        inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
 
         loss_mask = inputs["attention_mask"].clone()
         loss_mask[:, -1] = 0 # loss should not be computed for last token position
 
-        yield inputs, loss_mask
+        metadata_batch = []
+        for text in texts:
+            text_str = str(text)
+            metadata_batch.append({
+                "index": example_idx,
+                "text_preview": _text_preview(text_str),
+                "text_sha256": hashlib.sha256(text_str.encode("utf-8")).hexdigest(),
+            })
+            example_idx += 1
+
+        yield inputs, loss_mask, metadata_batch
 
 def compute_loss_over_dataset(model, tokenizer, batch_iterator, n_batches=256, fwd_pre_hooks=[], fwd_hooks=[]):
     accumulated_loss = torch.tensor(0, dtype=torch.float64, device=model.device)
     accumulated_n_tokens = torch.tensor(0, dtype=torch.int64, device=model.device)
+    per_example = []
 
     batch_idx = 0
-    for inputs, loss_mask in batch_iterator:
+    for inputs, loss_mask, metadata_batch in batch_iterator:
         if n_batches != -1 and batch_idx >= n_batches:
             break
 
@@ -136,15 +196,44 @@ def compute_loss_over_dataset(model, tokenizer, batch_iterator, n_batches=256, f
         # apply loss_mask
         log_probs_for_labels = log_probs_for_labels * loss_mask.to(log_probs_for_labels.device)
 
-        accumulated_loss += -log_probs_for_labels.sum()
-        accumulated_n_tokens += loss_mask.sum()
+        per_example_loss = -log_probs_for_labels.sum(dim=1).detach().to(torch.float64)
+        per_example_n_tokens = loss_mask.sum(dim=1).detach().to(torch.int64)
+
+        accumulated_loss += per_example_loss.sum()
+        accumulated_n_tokens += per_example_n_tokens.sum()
+
+        for row_idx in range(per_example_loss.shape[0]):
+            n_tokens = int(per_example_n_tokens[row_idx].item())
+            loss_sum = float(per_example_loss[row_idx].item())
+            if n_tokens > 0:
+                ce_loss = loss_sum / n_tokens
+                perplexity = _safe_exp(ce_loss)
+            else:
+                ce_loss = None
+                perplexity = None
+
+            metadata = dict(metadata_batch[row_idx]) if row_idx < len(metadata_batch) else {}
+            metadata.update({
+                "n_tokens": n_tokens,
+                "ce_loss": ce_loss,
+                "perplexity": perplexity,
+            })
+            per_example.append(metadata)
 
         batch_idx += 1
-    
-    ce_loss = accumulated_loss / accumulated_n_tokens
-    perplexity = torch.exp(ce_loss)    
 
-    return ce_loss, perplexity, accumulated_n_tokens
+    ce_loss = accumulated_loss / accumulated_n_tokens
+    ce_loss_value = ce_loss.item()
+    perplexities = [row.get("perplexity") for row in per_example]
+
+    return {
+        "ce_loss": ce_loss_value,
+        "perplexity": _safe_exp(ce_loss_value),
+        "perplexity_std": _sample_std(perplexities),
+        "n_tokens": accumulated_n_tokens.item(),
+        "n_examples": len(per_example),
+        "per_example": per_example,
+    }
 
 def evaluate_loss(
     model_base: ModelBase,
@@ -181,14 +270,16 @@ def evaluate_loss(
         else:
             raise ValueError(f"Unknown dataset label: {label}")
 
-        ce_loss, perplexity, n_tokens = compute_loss_over_dataset(model_base.model, model_base.tokenizer, dataset_iterator, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks, n_batches=n)
+        loss_stats = compute_loss_over_dataset(model_base.model, model_base.tokenizer, dataset_iterator, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks, n_batches=n)
         print(f"{label.upper()} DATASET{tag}:")
-        print(f"CE loss: {ce_loss.item()}, Perplexity: {perplexity.item()}, N tokens: {n_tokens.item()}")
+        print(
+            f"CE loss: {loss_stats['ce_loss']}, "
+            f"Perplexity: {loss_stats['perplexity']}, "
+            f"Perplexity std: {loss_stats['perplexity_std']}, "
+            f"N tokens: {loss_stats['n_tokens']}, "
+            f"N examples: {loss_stats['n_examples']}"
+        )
 
-        result[label] = {
-            "ce_loss": ce_loss.item(),
-            "perplexity": perplexity.item(),
-            "n_tokens": n_tokens.item()
-        }
+        result[label] = loss_stats
 
     return result
