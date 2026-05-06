@@ -431,14 +431,28 @@ def _maybe_evaluate_loss(cfg, dir_path, model_base, fwd_pre_hooks, fwd_hooks, la
         return
     if not cfg.force_overwrite and reuse_from and _try_link_from_siblings(out_path, reuse_from):
         return
-    on_dist_path = os.path.join(dir_path, 'completions', 'harmless_baseline_completions.json')
+    completions_dir = os.path.join(dir_path, 'completions')
+    harmful_dataset = next(iter(cfg.evaluation_datasets), 'jailbreakbench')
+    custom_paths = {}
+    harmful_path = os.path.join(completions_dir, f'{harmful_dataset}_baseline_completions.json')
+    harmless_path = os.path.join(completions_dir, 'harmless_baseline_completions.json')
+    if os.path.exists(harmful_path):
+        custom_paths['harmful_custom_completions'] = harmful_path
+    if os.path.exists(harmless_path):
+        custom_paths['harmless_custom_completions'] = harmless_path
+
+    dataset_labels = ['pile', 'alpaca', *custom_paths.keys()]
     loss_evals = evaluate_loss(
         model_base, fwd_pre_hooks, fwd_hooks,
         batch_size=cfg.ce_loss_batch_size,
         n_batches=cfg.ce_loss_n_batches,
-        completions_file_path=on_dist_path,
+        dataset_labels=dataset_labels,
+        custom_completions_file_paths=custom_paths,
         intervention_label=label,
     )
+    # Backward-compatible alias used by older dashboard/table code.
+    if 'harmless_custom_completions' in loss_evals:
+        loss_evals.setdefault('alpaca_custom_completions', loss_evals['harmless_custom_completions'])
     with open(out_path, 'w') as f:
         json.dump(loss_evals, f, indent=4)
 

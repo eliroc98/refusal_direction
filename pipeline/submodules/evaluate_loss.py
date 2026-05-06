@@ -244,9 +244,11 @@ def evaluate_loss(
     max_seq_length=256,
     dataset_labels=["pile", "alpaca", "alpaca_custom_completions"],
     completions_file_path=None,
+    custom_completions_file_paths=None,
     intervention_label: str = "",
 ):
     result = {}
+    custom_completions_file_paths = custom_completions_file_paths or {}
 
     tag = f" [{intervention_label}]" if intervention_label else ""
 
@@ -257,11 +259,12 @@ def evaluate_loss(
         elif label == 'alpaca':
             dataset_iterator = batch_iterator_alpaca(model_base.tokenize_instructions_fn, batch_size=batch_size, eoi_toks=torch.tensor(model_base.eoi_toks))
             n = n_batches
-        elif label == 'alpaca_custom_completions':
-            assert completions_file_path is not None, "A file path must be passed to load the completions"
+        elif label == 'alpaca_custom_completions' or label in custom_completions_file_paths:
+            path = custom_completions_file_paths.get(label, completions_file_path)
+            assert path is not None, "A file path must be passed to load the completions"
 
             dataset_iterator = batch_iterator_custom_completions(
-                completions_file_path=completions_file_path,
+                completions_file_path=path,
                 tokenize_instructions_fn=model_base.tokenize_instructions_fn,
                 batch_size=batch_size,
                 eoi_toks=torch.tensor(model_base.eoi_toks)
