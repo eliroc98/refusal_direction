@@ -4,7 +4,6 @@
 
 This project compares two approaches for extracting and manipulating the refusal direction in Large Language Models: the diff-in-means method from [Arditi et al. (2024)](https://arxiv.org/abs/2406.11717) and Iterative Nullspace Projection (INLP) from [Ravfogel et al. (2020)](https://aclanthology.org/2020.acl-main.647/). The codebase builds on the [original refusal_direction repository](https://github.com/andyrdt/refusal_direction) and extends it with INLP-based direction extraction, additional intervention types, and an expanded evaluation suite.
 
-- [Write-up](https://docs.google.com/document/d/1s5TXaa0ddkekicoAngFqszzOaZjxw7QN/edit?rtpof=true)
 
 ## Overview
 
@@ -27,14 +26,6 @@ Each intervention is evaluated on both safety and performance metrics:
 - **Perplexity**: cross-entropy loss on Pile (general text) and Alpaca (instruction-following).
 - **MMLU**: 5-shot accuracy on Massive Multitask Language Understanding.
 - **ARC**: 5-shot accuracy on ARC-Challenge.
-
-## Setup
-
-```bash
-git clone https://github.com/eliroc98/refusal_direction.git
-cd refusal_direction
-source setup.sh
-```
 
 The setup script will prompt you for a HuggingFace token (required to access gated models) and a Together AI token (used for evaluating jailbreak safety scores). It will then set up a virtual environment and install the required packages.
 
